@@ -2,6 +2,32 @@
   "name": "rollease",
   "version": "0.0.0-alpha.0",
   "description": "Framework-agnostic feature flag SDK — targeting rules, rollouts, releases, kill switches, segments, A/B experiments. Server and client on the same plane.",
+  "license": "MIT",
+  "author": "Rohit Tiwari",
+  "homepage": "https://github.com/rohittiwari-dev/rollease#readme",
+  "bugs": {
+    "url": "https://github.com/rohittiwari-dev/rollease/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rohittiwari-dev/rollease.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "feature-flags",
+    "feature-toggles",
+    "feature-management",
+    "rollouts",
+    "targeting-rules",
+    "react",
+    "nextjs",
+    "sequelize",
+    "prisma",
+    "drizzle",
+    "redis"
+  ],
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
   "types": "./dist/index.d.ts",
