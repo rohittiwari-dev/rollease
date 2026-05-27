@@ -1,0 +1,135 @@
+{
+  "name": "rollease",
+  "version": "0.0.0-alpha.0",
+  "description": "Framework-agnostic feature flag SDK — targeting rules, rollouts, releases, kill switches, segments, A/B experiments. Server and client on the same plane.",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    },
+    "./react": {
+      "types": "./dist/react.d.ts",
+      "import": "./dist/react.mjs",
+      "require": "./dist/react.js"
+    },
+    "./next": {
+      "types": "./dist/next.d.ts",
+      "import": "./dist/next.mjs",
+      "require": "./dist/next.js"
+    },
+    "./db/memory": {
+      "types": "./dist/db/memory.d.ts",
+      "import": "./dist/db/memory.mjs",
+      "require": "./dist/db/memory.js"
+    },
+    "./db/redis": {
+      "types": "./dist/db/redis.d.ts",
+      "import": "./dist/db/redis.mjs",
+      "require": "./dist/db/redis.js"
+    },
+    "./db/sequelize": {
+      "types": "./dist/db/sequelize.d.ts",
+      "import": "./dist/db/sequelize.mjs",
+      "require": "./dist/db/sequelize.js"
+    },
+    "./db/prisma": {
+      "types": "./dist/db/prisma.d.ts",
+      "import": "./dist/db/prisma.mjs",
+      "require": "./dist/db/prisma.js"
+    },
+    "./db/drizzle": {
+      "types": "./dist/db/drizzle.d.ts",
+      "import": "./dist/db/drizzle.mjs",
+      "require": "./dist/db/drizzle.js"
+    },
+    "./db/repository": {
+      "types": "./dist/db/repository.d.ts",
+      "import": "./dist/db/repository.mjs",
+      "require": "./dist/db/repository.js"
+    },
+    "./db/adapter": {
+      "types": "./dist/db/adapter.d.ts",
+      "import": "./dist/db/adapter.mjs",
+      "require": "./dist/db/adapter.js"
+    },
+    "./core/types": {
+      "types": "./dist/core/types.d.ts",
+      "import": "./dist/core/types.mjs",
+      "require": "./dist/core/types.js"
+    },
+    "./core/errors": {
+      "types": "./dist/core/errors.d.ts",
+      "import": "./dist/core/errors.mjs",
+      "require": "./dist/core/errors.js"
+    },
+    "./core/security": {
+      "types": "./dist/core/security.d.ts",
+      "import": "./dist/core/security.mjs",
+      "require": "./dist/core/security.js"
+    },
+    "./engine/evaluator": {
+      "types": "./dist/engine/evaluator.d.ts",
+      "import": "./dist/engine/evaluator.mjs",
+      "require": "./dist/engine/evaluator.js"
+    },
+    "./engine/manager": {
+      "types": "./dist/engine/manager.d.ts",
+      "import": "./dist/engine/manager.mjs",
+      "require": "./dist/engine/manager.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "clean": "rm -rf dist"
+  },
+  "peerDependencies": {
+    "@prisma/client": "^5.0.0 || ^6.0.0",
+    "drizzle-orm": "^0.36.0",
+    "next": "",
+    "react": "^19.2.6",
+    "sequelize": "^6.37.0"
+  },
+  "peerDependenciesMeta": {
+    "@prisma/client": {
+      "optional": true
+    },
+    "drizzle-orm": {
+      "optional": true
+    },
+    "next": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    },
+    "sequelize": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "pg": "^8.13.1",
+    "redis": "^4.7.0"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.3.2",
+    "@types/node": "^20.11.0",
+    "@types/pg": "^8.11.10",
+    "@types/react": "^19.0.0",
+    "@vitest/coverage-v8": "^4.1.7",
+    "happy-dom": "^20.9.0",
+    "next": "^15.0.0",
+    "react-dom": "^19.2.6",
+    "tsup": "^8.3.5",
+    "typescript": "5.9.2",
+    "vitest": "^4.1.7"
+  }
+}
