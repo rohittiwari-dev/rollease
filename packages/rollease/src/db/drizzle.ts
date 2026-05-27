@@ -5,15 +5,17 @@
 import { ValidationError } from "../core/errors";
 import {
   RepositoryDbAdapter,
+  ROLLEASE_OPTIONAL_REPOSITORY_NAMES,
   ROLLEASE_REPOSITORY_NAMES,
   ROLLEASE_REPOSITORY_REQUIRED_COLUMNS,
+  type AnyRepositoryName,
   type RepositoryFindManyOptions,
   type RepositoryName,
   type RepositorySet,
   type RowRepository,
 } from "./repository";
 
-export type DrizzleAdapterModelName = RepositoryName;
+export type DrizzleAdapterModelName = AnyRepositoryName;
 export type DrizzleTableLike = Record<string | symbol, unknown>;
 export type DrizzleTableMap = Partial<Record<DrizzleAdapterModelName, DrizzleTableLike>>;
 
@@ -96,12 +98,15 @@ export function createDrizzleAdapter(options: DrizzleAdapterOptions): DrizzleDbA
 }
 
 export function validateDrizzleTables(tables: DrizzleTableMap): void {
-  for (const name of ROLLEASE_REPOSITORY_NAMES) {
+  const validate = (name: DrizzleAdapterModelName, required: boolean): void => {
     const table = tables[name];
     if (!table) {
-      throw new ValidationError(`Missing Drizzle table for Rollease model "${name}"`, {
-        model: name,
-      });
+      if (required) {
+        throw new ValidationError(`Missing Drizzle table for Rollease model "${name}"`, {
+          model: name,
+        });
+      }
+      return;
     }
 
     const columns = getDrizzleColumnNames(table);
@@ -114,7 +119,10 @@ export function validateDrizzleTables(tables: DrizzleTableMap): void {
         { model: name, missingColumns: missing }
       );
     }
-  }
+  };
+
+  for (const name of ROLLEASE_REPOSITORY_NAMES) validate(name, true);
+  for (const name of ROLLEASE_OPTIONAL_REPOSITORY_NAMES) validate(name, false);
 }
 
 function createDrizzleRepositories(
@@ -123,18 +131,26 @@ function createDrizzleRepositories(
   helpers?: Partial<DrizzleHelpers>
 ): RepositorySet {
   const loadHelpers = createDrizzleHelperLoader(helpers);
+  const entries: Array<[DrizzleAdapterModelName, RowRepository]> = [];
 
-  return Object.fromEntries(
-    ROLLEASE_REPOSITORY_NAMES.map((name) => {
-      const table = tables[name];
-      if (!table) {
-        throw new ValidationError(`Missing Drizzle table for Rollease model "${name}"`, {
-          model: name,
-        });
-      }
-      return [name, createDrizzleRepository(name, db, table, loadHelpers)];
-    })
-  ) as RepositorySet;
+  for (const name of ROLLEASE_REPOSITORY_NAMES) {
+    const table = tables[name];
+    if (!table) {
+      throw new ValidationError(`Missing Drizzle table for Rollease model "${name}"`, {
+        model: name,
+      });
+    }
+    entries.push([name, createDrizzleRepository(name, db, table, loadHelpers)]);
+  }
+
+  for (const name of ROLLEASE_OPTIONAL_REPOSITORY_NAMES) {
+    const table = tables[name];
+    if (table) {
+      entries.push([name, createDrizzleRepository(name, db, table, loadHelpers)]);
+    }
+  }
+
+  return Object.fromEntries(entries) as RepositorySet;
 }
 
 function createDrizzleRepository(

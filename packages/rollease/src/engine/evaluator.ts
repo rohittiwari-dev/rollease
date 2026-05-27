@@ -16,6 +16,7 @@ import type {
   Segment,
   RolloutConfig,
   EvalReason,
+  ExclusionLayer,
 } from "../core/types";
 
 // ── Semver Utilities ───────────────────────────────────────────────────────
@@ -259,6 +260,13 @@ function evaluateRule(rule: FlagRule, context: FlagContext, flagKey: string): bo
   // Rule disabled → skip
   if (!rule.enabled) return false;
 
+  // User-list targeting — if userIds is set, only these users can match
+  if (rule.userIds && rule.userIds.length > 0) {
+    if (!context.userId || !rule.userIds.includes(context.userId)) {
+      return false;
+    }
+  }
+
   // Evaluate conditions
   if (!evaluateConditionGroup(rule.conditions, context)) {
     return false;
@@ -317,6 +325,15 @@ export interface EvaluateOptions {
   /** Current date (for testing date-based logic) */
   now?: Date;
   /**
+   * Pre-evaluated prerequisite flag results. Keyed by flagKey.
+   * Used by FlagManager to pass resolved prerequisites to the evaluator.
+   */
+  prerequisiteResults?: Record<string, FlagResult>;
+  /**
+   * Optional exclusion layer details for the layer this flag belongs to.
+   */
+  exclusionLayer?: ExclusionLayer;
+  /**
    * Optional logger callback for evaluator warnings (e.g. a rule pointing at
    * a deleted variant). Keeps the evaluator pure — it never touches console
    * directly so it stays safe in Edge runtimes and tests.
@@ -366,6 +383,32 @@ export function evaluateFlag<T = unknown>(
     const expDate = new Date(flag.expiresAt);
     if (expDate.getTime() < now.getTime()) {
       return makeResult(flag, flag.defaultValue, null, "expired", null, now);
+    }
+  }
+
+  // ── Step 4.5: Prerequisites ─────────────────────────────────────
+  if (flag.prerequisites && flag.prerequisites.length > 0 && options.prerequisiteResults) {
+    for (const prereq of flag.prerequisites) {
+      const prereqResult = options.prerequisiteResults[prereq.flagKey];
+      if (!prereqResult || prereqResult.value !== prereq.variation) {
+        return makeResult(flag, flag.defaultValue, null, "prerequisite_not_met", null, now);
+      }
+    }
+  }
+
+  // ── Step 4.6: Exclusion Layers ──────────────────────────────────
+  if (flag.exclusionLayer) {
+    if (!options.exclusionLayer) {
+      return makeResult(flag, flag.defaultValue, null, "exclusion_layer_not_found", null, now);
+    }
+    const userId = context.userId;
+    if (!userId) {
+      return makeResult(flag, flag.defaultValue, null, "exclusion_group_miss", null, now);
+    }
+    const bucket = getBucket(userId, options.exclusionLayer.key);
+    const allocation = options.exclusionLayer.allocations.find((a) => a.flagKey === flag.key);
+    if (!allocation || bucket < allocation.startBucket || bucket >= allocation.endBucket) {
+      return makeResult(flag, flag.defaultValue, null, "exclusion_group_miss", null, now);
     }
   }
 
@@ -464,7 +507,14 @@ export function evaluateFlag<T = unknown>(
     }
   }
 
-  // ── Step 9: Default ──────────────────────────────────────────────────
+  // ── Step 9: Default ────────────────────────────────────────────
+  // Check per-environment defaults before the global default
+  if (flag.environmentDefaults && context.environment) {
+    const envDefault = flag.environmentDefaults[context.environment];
+    if (envDefault !== undefined) {
+      return makeResult(flag, envDefault, null, "default", null, now);
+    }
+  }
   return makeResult(flag, flag.defaultValue, null, "default", null, now);
 }
 
@@ -479,7 +529,13 @@ function makeResult<T>(
   evaluatedAt: Date
 ): FlagResult<T> {
   const enabled =
-    reason === "kill_switch" || reason === "disabled" || reason === "expired" || reason === "not_scheduled"
+    reason === "kill_switch" ||
+    reason === "disabled" ||
+    reason === "expired" ||
+    reason === "not_scheduled" ||
+    reason === "prerequisite_not_met" ||
+    reason === "exclusion_group_miss" ||
+    reason === "exclusion_layer_not_found"
       ? false
       : reason === "default"
         ? flag.type === "boolean"

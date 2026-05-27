@@ -23,6 +23,8 @@ import type {
   CreateReleaseInput,
   FlagStatus,
   SegmentUsage,
+  ExclusionLayer,
+  ExclusionLayerAllocation,
 } from "../core/types";
 import {
   FlagNotFoundError,
@@ -47,6 +49,7 @@ export class MemoryDbAdapter implements DbAdapter {
   private segments = new Map<string, Segment>();
   private releases = new Map<string, Release>();
   private assignments = new Map<string, string>(); // `${flagKey}:${userId}` → variantKey
+  private exclusionLayers = new Map<string, ExclusionLayer>();
   private history: HistoryEntry[] = [];
   private impressions: Array<Record<string, unknown>> = [];
 
@@ -77,6 +80,10 @@ export class MemoryDbAdapter implements DbAdapter {
       rollout: input.rollout,
       scheduledAt: input.scheduledAt || null,
       expiresAt: input.expiresAt || null,
+      prerequisites: input.prerequisites,
+      environmentDefaults: input.environmentDefaults,
+      lastEvaluatedAt: null,
+      exclusionLayer: input.exclusionLayer,
       createdAt: now,
       updatedAt: now,
     };
@@ -135,6 +142,15 @@ export class MemoryDbAdapter implements DbAdapter {
           f.key.toLowerCase().includes(q) ||
           (f.description && f.description.toLowerCase().includes(q))
       );
+    }
+
+    // Stale flag filter
+    if (input.staleAfter) {
+      const staleDate = new Date(input.staleAfter).getTime();
+      flags = flags.filter((f) => {
+        if (!f.lastEvaluatedAt) return true; // never evaluated = stale
+        return new Date(f.lastEvaluatedAt).getTime() < staleDate;
+      });
     }
 
     const total = flags.length;
@@ -310,6 +326,9 @@ export class MemoryDbAdapter implements DbAdapter {
       rolloutPct: input.rolloutPct,
       isHoldout: input.isHoldout,
       variantId: input.variantId,
+      userIds: input.userIds,
+      description: input.description,
+      metadata: input.metadata,
     };
 
     const rules = this.rules.get(flagKey) || [];
@@ -482,6 +501,11 @@ export class MemoryDbAdapter implements DbAdapter {
       rolledBackAt: null,
       rolledBackBy: undefined,
       rollbackReason: undefined,
+      requiresApproval: input.requiresApproval,
+      requiredApprovers: input.requiredApprovers,
+      approvalStatus: input.requiresApproval ? "pending" : undefined,
+      approvals: input.requiresApproval ? [] : undefined,
+      rejectionReason: undefined,
       createdAt: now,
     };
 
@@ -651,6 +675,92 @@ export class MemoryDbAdapter implements DbAdapter {
     });
   }
 
+  async approveRelease(releaseId: string, approverId: string): Promise<Release> {
+    const release = this.releases.get(releaseId);
+    if (!release) throw new ReleaseNotFoundError(releaseId);
+
+    if (!release.approvals) {
+      release.approvals = [];
+    }
+    if (!release.approvals.includes(approverId)) {
+      release.approvals.push(approverId);
+    }
+
+    const required = release.requiredApprovers || [];
+    let isApproved = false;
+    if (required.length > 0) {
+      isApproved = required.every((req) => release.approvals!.includes(req));
+    } else {
+      isApproved = release.approvals.length > 0;
+    }
+
+    if (isApproved) {
+      release.approvalStatus = "approved";
+    }
+
+    this.releases.set(releaseId, release);
+
+    await this.addHistory({
+      action: "release.approved",
+      at: new Date(),
+      releaseId,
+      by: approverId,
+    });
+
+    return release;
+  }
+
+  async rejectRelease(releaseId: string, rejectorId: string, reason?: string): Promise<Release> {
+    const release = this.releases.get(releaseId);
+    if (!release) throw new ReleaseNotFoundError(releaseId);
+
+    release.approvalStatus = "rejected";
+    release.rejectionReason = reason;
+    this.releases.set(releaseId, release);
+
+    await this.addHistory({
+      action: "release.rejected",
+      at: new Date(),
+      releaseId,
+      by: rejectorId,
+      reason,
+    });
+
+    return release;
+  }
+
+  // ── Exclusion Layers ────────────────────────────────────────────────────────
+
+  async createExclusionLayer(input: ExclusionLayer): Promise<ExclusionLayer> {
+    if (this.exclusionLayers.has(input.key)) {
+      throw new FlagConflictError(input.key, "exclusion layer");
+    }
+    this.exclusionLayers.set(input.key, input);
+    return input;
+  }
+
+  async getExclusionLayer(key: string): Promise<ExclusionLayer | null> {
+    return this.exclusionLayers.get(key) || null;
+  }
+
+  async updateExclusionLayer(key: string, allocations: ExclusionLayerAllocation[]): Promise<ExclusionLayer> {
+    const layer = this.exclusionLayers.get(key);
+    if (!layer) throw new Error(`Exclusion layer ${key} not found`);
+
+    layer.allocations = allocations;
+    this.exclusionLayers.set(key, layer);
+    return layer;
+  }
+
+  async deleteExclusionLayer(key: string): Promise<void> {
+    if (!this.exclusionLayers.has(key)) throw new Error(`Exclusion layer ${key} not found`);
+    this.exclusionLayers.delete(key);
+  }
+
+  async listExclusionLayers(): Promise<ExclusionLayer[]> {
+    return Array.from(this.exclusionLayers.values());
+  }
+
   // ── Sticky Assignments ───────────────────────────────────────────────
 
   async getUserAssignment(flagKey: string, userId: string): Promise<string | null> {
@@ -772,6 +882,16 @@ export class MemoryDbAdapter implements DbAdapter {
   /** Get rules for a flag. Used internally by the evaluator. */
   getRulesForFlag(flagKey: string): FlagRule[] {
     return [...(this.rules.get(flagKey) || [])];
+  }
+
+  // ── Stale Flag Detection ──────────────────────────────────────────────
+
+  async touchFlagEvaluation(key: string): Promise<void> {
+    const flag = this.flags.get(key);
+    if (flag) {
+      flag.lastEvaluatedAt = new Date();
+      this.flags.set(key, flag);
+    }
   }
 }
 

@@ -8,7 +8,10 @@ import type {
   CreateFlagInput,
   CreateReleaseInput,
   CreateSegmentInput,
+  ExclusionLayer,
+  ExclusionLayerAllocation,
   Flag,
+  FlagPrerequisite,
   FlagRule,
   FlagStatus,
   HistoryEntry,
@@ -74,6 +77,7 @@ type Models = {
   Assignment: ModelLike;
   History: ModelLike;
   Impression: ModelLike;
+  ExclusionLayer: ModelLike;
 };
 
 export type SequelizeAdapterModelName = keyof Models;
@@ -98,6 +102,26 @@ export interface SequelizeAdapterOptions {
 
 
 
+/**
+ * Models that are required for the adapter to construct successfully. The
+ * `ExclusionLayer` model is optional (kept here in this record for the
+ * column contract, but skipped by `validateSequelizeAdapterModels` when
+ * absent so existing users without that table aren't blocked).
+ */
+export const ROLLEASE_SEQUELIZE_REQUIRED_MODELS: SequelizeAdapterModelName[] = [
+  "Flag",
+  "Rule",
+  "Segment",
+  "Release",
+  "Assignment",
+  "History",
+  "Impression",
+];
+
+export const ROLLEASE_SEQUELIZE_OPTIONAL_MODELS: SequelizeAdapterModelName[] = [
+  "ExclusionLayer",
+];
+
 export const ROLLEASE_SEQUELIZE_REQUIRED_COLUMNS: Record<
   SequelizeAdapterModelName,
   string[]
@@ -118,6 +142,10 @@ export const ROLLEASE_SEQUELIZE_REQUIRED_COLUMNS: Record<
     "rollout",
     "scheduledAt",
     "expiresAt",
+    "prerequisites",
+    "environmentDefaults",
+    "exclusionLayer",
+    "lastEvaluatedAt",
     "createdAt",
     "updatedAt",
   ],
@@ -132,6 +160,9 @@ export const ROLLEASE_SEQUELIZE_REQUIRED_COLUMNS: Record<
     "rolloutPct",
     "isHoldout",
     "variantId",
+    "userIds",
+    "description",
+    "metadata",
   ],
   Segment: ["key", "description", "rules", "createdAt", "updatedAt"],
   Release: [
@@ -148,11 +179,17 @@ export const ROLLEASE_SEQUELIZE_REQUIRED_COLUMNS: Record<
     "rolledBackAt",
     "rolledBackBy",
     "rollbackReason",
+    "requiresApproval",
+    "requiredApprovers",
+    "approvalStatus",
+    "approvals",
+    "rejectionReason",
     "createdAt",
   ],
   Assignment: ["flagKey", "userId", "variantKey"],
   History: ["id", "flagKey", "action", "by", "at", "changes", "reason", "releaseId"],
   Impression: ["id", "flagKey", "userId", "value", "variant", "reason", "at"],
+  ExclusionLayer: ["key", "description", "flagKeys", "allocations"],
 };
 
 export class SequelizeDbAdapter implements DbAdapter {
@@ -214,6 +251,12 @@ export class SequelizeDbAdapter implements DbAdapter {
       rollout: input.rollout,
       scheduledAt: input.scheduledAt ? new Date(input.scheduledAt) : null,
       expiresAt: input.expiresAt ? new Date(input.expiresAt) : null,
+      // Tier 2/3 fields — persist when provided so Sequelize-backed adapters
+      // surface the same surface as Memory/Repository adapters.
+      prerequisites: input.prerequisites ?? null,
+      environmentDefaults: input.environmentDefaults ?? null,
+      exclusionLayer: input.exclusionLayer ?? null,
+      lastEvaluatedAt: null,
       createdAt: now,
       updatedAt: now,
     });
@@ -266,6 +309,15 @@ export class SequelizeDbAdapter implements DbAdapter {
           flag.key.toLowerCase().includes(search) ||
           Boolean(flag.description?.toLowerCase().includes(search))
       );
+    }
+    if (input.staleAfter) {
+      const staleThreshold = new Date(input.staleAfter).getTime();
+      flags = flags.filter((flag) => {
+        const evaluatedAt = flag.lastEvaluatedAt
+          ? new Date(flag.lastEvaluatedAt).getTime()
+          : 0;
+        return evaluatedAt < staleThreshold;
+      });
     }
 
     const total = flags.length;
@@ -425,6 +477,9 @@ export class SequelizeDbAdapter implements DbAdapter {
       rolloutPct: input.rolloutPct,
       isHoldout: input.isHoldout,
       variantId: input.variantId,
+      userIds: input.userIds ?? null,
+      description: input.description ?? null,
+      metadata: input.metadata ?? null,
     });
 
     await this.addHistory({
@@ -582,9 +637,152 @@ export class SequelizeDbAdapter implements DbAdapter {
         rolledBackAt: null,
         rolledBackBy: undefined,
         rollbackReason: undefined,
+        requiresApproval: input.requiresApproval ?? false,
+        requiredApprovers: input.requiredApprovers ?? null,
+        approvalStatus: input.requiresApproval ? "pending" : null,
+        approvals: [],
+        rejectionReason: null,
         createdAt: now,
       })
     );
+  }
+
+  async approveRelease(
+    releaseId: string,
+    approverId: string
+  ): Promise<Release> {
+    const models = await this.getModels();
+    const release = await this.getRelease(releaseId);
+    if (!release) throw new ReleaseNotFoundError(releaseId);
+
+    const approvals = Array.isArray(release.approvals)
+      ? [...release.approvals]
+      : [];
+    if (!approvals.includes(approverId)) approvals.push(approverId);
+
+    let approvalStatus: Release["approvalStatus"] =
+      release.approvalStatus ?? "pending";
+    const required = release.requiredApprovers ?? [];
+    if (required.length > 0) {
+      if (required.every((req) => approvals.includes(req))) {
+        approvalStatus = "approved";
+      }
+    } else if (approvals.length > 0) {
+      approvalStatus = "approved";
+    }
+
+    await models.Release.update(
+      { approvals, approvalStatus },
+      { where: { id: releaseId } }
+    );
+    await this.addHistory({
+      action: "release.approved",
+      at: new Date(),
+      releaseId,
+      by: approverId,
+    });
+    return (await this.getRelease(releaseId))!;
+  }
+
+  async rejectRelease(
+    releaseId: string,
+    rejectorId: string,
+    reason?: string
+  ): Promise<Release> {
+    const models = await this.getModels();
+    if (!(await this.getRelease(releaseId))) {
+      throw new ReleaseNotFoundError(releaseId);
+    }
+    await models.Release.update(
+      { approvalStatus: "rejected", rejectionReason: reason ?? null },
+      { where: { id: releaseId } }
+    );
+    await this.addHistory({
+      action: "release.rejected",
+      at: new Date(),
+      releaseId,
+      by: rejectorId,
+      reason,
+    });
+    return (await this.getRelease(releaseId))!;
+  }
+
+  // ── Exclusion Layers ────────────────────────────────────────────────
+
+  async createExclusionLayer(input: ExclusionLayer): Promise<ExclusionLayer> {
+    const models = await this.getModels();
+    const existing = await models.ExclusionLayer.findOne({
+      where: { key: input.key },
+    });
+    if (existing) throw new FlagConflictError(input.key, "exclusion layer");
+    await models.ExclusionLayer.create({
+      key: input.key,
+      description: input.description ?? null,
+      flagKeys: input.flagKeys,
+      allocations: input.allocations,
+    });
+    return input;
+  }
+
+  async getExclusionLayer(key: string): Promise<ExclusionLayer | null> {
+    const models = await this.getModels();
+    const row = await models.ExclusionLayer.findOne({ where: { key } });
+    return row ? this.toExclusionLayer(row) : null;
+  }
+
+  async updateExclusionLayer(
+    key: string,
+    allocations: ExclusionLayerAllocation[]
+  ): Promise<ExclusionLayer> {
+    const models = await this.getModels();
+    const row = await models.ExclusionLayer.findOne({ where: { key } });
+    if (!row) {
+      throw new ValidationError(`Exclusion layer "${key}" not found`, {
+        exclusionLayer: key,
+      });
+    }
+    await models.ExclusionLayer.update({ allocations }, { where: { key } });
+    const updated = await models.ExclusionLayer.findOne({ where: { key } });
+    return this.toExclusionLayer(updated!);
+  }
+
+  async deleteExclusionLayer(key: string): Promise<void> {
+    const models = await this.getModels();
+    const row = await models.ExclusionLayer.findOne({ where: { key } });
+    if (!row) {
+      throw new ValidationError(`Exclusion layer "${key}" not found`, {
+        exclusionLayer: key,
+      });
+    }
+    await models.ExclusionLayer.destroy({ where: { key } });
+  }
+
+  async listExclusionLayers(): Promise<ExclusionLayer[]> {
+    const models = await this.getModels();
+    const rows = await models.ExclusionLayer.findAll();
+    return rows.map((row) => this.toExclusionLayer(row));
+  }
+
+  async touchFlagEvaluation(key: string): Promise<void> {
+    try {
+      const models = await this.getModels();
+      await models.Flag.update(
+        { lastEvaluatedAt: new Date() },
+        { where: { key } }
+      );
+    } catch {
+      // best-effort
+    }
+  }
+
+  private toExclusionLayer(row: unknown): ExclusionLayer {
+    const data = plain(row);
+    return {
+      key: String(data.key),
+      description: optionalString(data.description),
+      flagKeys: arrayOrUndefined<string>(data.flagKeys) ?? [],
+      allocations: arrayOrUndefined<ExclusionLayerAllocation>(data.allocations) ?? [],
+    };
   }
 
   async getRelease(releaseId: string): Promise<Release | null> {
@@ -916,6 +1114,11 @@ export class SequelizeDbAdapter implements DbAdapter {
           rollout: field(DataTypes, "JSON"),
           scheduledAt: field(DataTypes, "DATE"),
           expiresAt: field(DataTypes, "DATE"),
+          // Tier 2/3 — prerequisites, env-defaults, exclusion, stale-detect.
+          prerequisites: field(DataTypes, "JSON"),
+          environmentDefaults: field(DataTypes, "JSON"),
+          exclusionLayer: field(DataTypes, "STRING"),
+          lastEvaluatedAt: field(DataTypes, "DATE"),
           createdAt: field(DataTypes, "DATE", { allowNull: false }),
           updatedAt: field(DataTypes, "DATE", { allowNull: false }),
         },
@@ -935,6 +1138,10 @@ export class SequelizeDbAdapter implements DbAdapter {
           rolloutPct: field(DataTypes, "FLOAT"),
           isHoldout: field(DataTypes, "BOOLEAN"),
           variantId: field(DataTypes, "STRING"),
+          // Tier 2 — user-list, description, metadata for rules.
+          userIds: field(DataTypes, "JSON"),
+          description: field(DataTypes, "TEXT"),
+          metadata: field(DataTypes, "JSON"),
         },
         { tableName: table("rules"), timestamps: false }
       ),
@@ -967,6 +1174,12 @@ export class SequelizeDbAdapter implements DbAdapter {
           rolledBackAt: field(DataTypes, "DATE"),
           rolledBackBy: field(DataTypes, "STRING"),
           rollbackReason: field(DataTypes, "TEXT"),
+          // Tier 2 — approval workflow.
+          requiresApproval: field(DataTypes, "BOOLEAN"),
+          requiredApprovers: field(DataTypes, "JSON"),
+          approvalStatus: field(DataTypes, "STRING"),
+          approvals: field(DataTypes, "JSON"),
+          rejectionReason: field(DataTypes, "TEXT"),
           createdAt: field(DataTypes, "DATE", { allowNull: false }),
         },
         { tableName: table("releases"), timestamps: false }
@@ -1010,6 +1223,18 @@ export class SequelizeDbAdapter implements DbAdapter {
         },
         { tableName: table("impressions"), timestamps: false }
       ),
+      // Tier 2/3 — Mutual exclusion layers (Statsig-style "layers").
+      ExclusionLayer: this.useModel(
+        "ExclusionLayer",
+        model("ExclusionLayer"),
+        {
+          key: field(DataTypes, "STRING", { primaryKey: true }),
+          description: field(DataTypes, "TEXT"),
+          flagKeys: field(DataTypes, "JSON", { allowNull: false }),
+          allocations: field(DataTypes, "JSON", { allowNull: false }),
+        },
+        { tableName: table("exclusion_layers"), timestamps: false }
+      ),
     };
 
     if (this.validateColumns) {
@@ -1050,6 +1275,15 @@ export class SequelizeDbAdapter implements DbAdapter {
       rollout: data.rollout as Flag["rollout"],
       scheduledAt: nullableDate(data.scheduledAt),
       expiresAt: nullableDate(data.expiresAt),
+      prerequisites: arrayOrUndefined<FlagPrerequisite>(data.prerequisites),
+      environmentDefaults:
+        data.environmentDefaults &&
+        typeof data.environmentDefaults === "object" &&
+        !Array.isArray(data.environmentDefaults)
+          ? (data.environmentDefaults as Record<string, unknown>)
+          : undefined,
+      exclusionLayer: optionalString(data.exclusionLayer),
+      lastEvaluatedAt: nullableDate(data.lastEvaluatedAt),
       createdAt: date(data.createdAt),
       updatedAt: date(data.updatedAt),
     };
@@ -1068,6 +1302,14 @@ export class SequelizeDbAdapter implements DbAdapter {
       rolloutPct: optionalNumber(data.rolloutPct),
       isHoldout: optionalBoolean(data.isHoldout),
       variantId: optionalString(data.variantId),
+      userIds: arrayOrUndefined<string>(data.userIds),
+      description: optionalString(data.description),
+      metadata:
+        data.metadata &&
+        typeof data.metadata === "object" &&
+        !Array.isArray(data.metadata)
+          ? (data.metadata as Record<string, unknown>)
+          : undefined,
     };
   }
 
@@ -1098,6 +1340,19 @@ export class SequelizeDbAdapter implements DbAdapter {
       rolledBackAt: nullableDate(data.rolledBackAt),
       rolledBackBy: optionalString(data.rolledBackBy),
       rollbackReason: optionalString(data.rollbackReason),
+      requiresApproval:
+        data.requiresApproval === undefined
+          ? undefined
+          : Boolean(data.requiresApproval),
+      requiredApprovers: arrayOrUndefined<string>(data.requiredApprovers),
+      approvalStatus:
+        data.approvalStatus === "pending" ||
+        data.approvalStatus === "approved" ||
+        data.approvalStatus === "rejected"
+          ? data.approvalStatus
+          : undefined,
+      approvals: arrayOrUndefined<string>(data.approvals),
+      rejectionReason: optionalString(data.rejectionReason),
       createdAt: date(data.createdAt),
     };
   }
@@ -1126,14 +1381,22 @@ export function createSequelizeAdapter(
 export function validateSequelizeAdapterModels(
   models: SequelizeAdapterModels
 ): void {
-  for (const modelName of Object.keys(
-    ROLLEASE_SEQUELIZE_REQUIRED_COLUMNS
-  ) as SequelizeAdapterModelName[]) {
+  const allModels = [
+    ...ROLLEASE_SEQUELIZE_REQUIRED_MODELS,
+    ...ROLLEASE_SEQUELIZE_OPTIONAL_MODELS,
+  ];
+  const requiredSet = new Set<SequelizeAdapterModelName>(
+    ROLLEASE_SEQUELIZE_REQUIRED_MODELS
+  );
+  for (const modelName of allModels) {
     const model = models[modelName];
     if (!model) {
-      throw new ValidationError(`Missing Sequelize model "${modelName}"`, {
-        model: modelName,
-      });
+      if (requiredSet.has(modelName)) {
+        throw new ValidationError(`Missing Sequelize model "${modelName}"`, {
+          model: modelName,
+        });
+      }
+      continue; // optional and absent — skip silently
     }
 
     const columns = getModelColumnNames(model);

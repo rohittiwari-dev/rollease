@@ -9,7 +9,10 @@ import type {
   CreateFlagInput,
   CreateReleaseInput,
   CreateSegmentInput,
+  ExclusionLayer,
+  ExclusionLayerAllocation,
   Flag,
+  FlagPrerequisite,
   FlagRule,
   FlagStatus,
   HistoryEntry,
@@ -46,6 +49,16 @@ export type RepositoryName =
   | "History"
   | "Impression";
 
+/**
+ * Repositories that are optional for backwards-compatibility. If absent,
+ * the corresponding feature (e.g. exclusion layers) is disabled at runtime
+ * but the adapter still constructs and the required surface keeps working.
+ */
+export type OptionalRepositoryName = "ExclusionLayer";
+
+/** Combined name union for typing of the repository map. */
+export type AnyRepositoryName = RepositoryName | OptionalRepositoryName;
+
 export interface RepositoryFindManyOptions {
   where?: Record<string, unknown>;
   orderBy?: Array<{ field: string; direction: "asc" | "desc" }>;
@@ -63,7 +76,13 @@ export interface RowRepository {
   deleteMany(where: Record<string, unknown>): Promise<void>;
 }
 
-export type RepositorySet = Record<RepositoryName, RowRepository>;
+/**
+ * Set of row repositories required by the adapter. Optional repos (e.g.
+ * `ExclusionLayer`) are added via the Partial intersection so existing
+ * users without those tables continue to construct without errors.
+ */
+export type RepositorySet = Record<RepositoryName, RowRepository> &
+  Partial<Record<OptionalRepositoryName, RowRepository>>;
 
 export const ROLLEASE_REPOSITORY_NAMES: RepositoryName[] = [
   "Flag",
@@ -75,8 +94,12 @@ export const ROLLEASE_REPOSITORY_NAMES: RepositoryName[] = [
   "Impression",
 ];
 
+export const ROLLEASE_OPTIONAL_REPOSITORY_NAMES: OptionalRepositoryName[] = [
+  "ExclusionLayer",
+];
+
 export const ROLLEASE_REPOSITORY_REQUIRED_COLUMNS: Record<
-  RepositoryName,
+  AnyRepositoryName,
   string[]
 > = {
   Flag: [
@@ -95,6 +118,10 @@ export const ROLLEASE_REPOSITORY_REQUIRED_COLUMNS: Record<
     "rollout",
     "scheduledAt",
     "expiresAt",
+    "prerequisites",
+    "environmentDefaults",
+    "exclusionLayer",
+    "lastEvaluatedAt",
     "createdAt",
     "updatedAt",
   ],
@@ -109,6 +136,9 @@ export const ROLLEASE_REPOSITORY_REQUIRED_COLUMNS: Record<
     "rolloutPct",
     "isHoldout",
     "variantId",
+    "userIds",
+    "description",
+    "metadata",
   ],
   Segment: ["key", "description", "rules", "createdAt", "updatedAt"],
   Release: [
@@ -125,11 +155,17 @@ export const ROLLEASE_REPOSITORY_REQUIRED_COLUMNS: Record<
     "rolledBackAt",
     "rolledBackBy",
     "rollbackReason",
+    "requiresApproval",
+    "requiredApprovers",
+    "approvalStatus",
+    "approvals",
+    "rejectionReason",
     "createdAt",
   ],
   Assignment: ["flagKey", "userId", "variantKey"],
   History: ["id", "flagKey", "action", "by", "at", "changes", "reason", "releaseId"],
   Impression: ["id", "flagKey", "userId", "value", "variant", "reason", "at"],
+  ExclusionLayer: ["key", "description", "flagKeys", "allocations"],
 };
 
 
@@ -176,6 +212,13 @@ export class RepositoryDbAdapter implements DbAdapter {
       rollout: input.rollout,
       scheduledAt: input.scheduledAt ? new Date(input.scheduledAt) : null,
       expiresAt: input.expiresAt ? new Date(input.expiresAt) : null,
+      // Tier 2/3 fields — persist when provided so the storage layer doesn't
+      // silently drop them, which would make these features no-ops on Prisma
+      // and Drizzle.
+      prerequisites: input.prerequisites ?? null,
+      environmentDefaults: input.environmentDefaults ?? null,
+      exclusionLayer: input.exclusionLayer ?? null,
+      lastEvaluatedAt: null,
       createdAt: now,
       updatedAt: now,
     });
@@ -226,6 +269,16 @@ export class RepositoryDbAdapter implements DbAdapter {
           flag.key.toLowerCase().includes(search) ||
           Boolean(flag.description?.toLowerCase().includes(search))
       );
+    }
+    if (input.staleAfter) {
+      const staleThreshold = new Date(input.staleAfter).getTime();
+      flags = flags.filter((flag) => {
+        // Treat never-evaluated flags as stale (very old).
+        const evaluatedAt = flag.lastEvaluatedAt
+          ? new Date(flag.lastEvaluatedAt).getTime()
+          : 0;
+        return evaluatedAt < staleThreshold;
+      });
     }
 
     const total = flags.length;
@@ -383,6 +436,10 @@ export class RepositoryDbAdapter implements DbAdapter {
       rolloutPct: input.rolloutPct,
       isHoldout: input.isHoldout,
       variantId: input.variantId,
+      // Tier 2 — persist user-list, description, and operational metadata.
+      userIds: input.userIds ?? null,
+      description: input.description ?? null,
+      metadata: input.metadata ?? null,
     });
 
     await this.addHistory({
@@ -532,9 +589,68 @@ export class RepositoryDbAdapter implements DbAdapter {
         rolledBackAt: null,
         rolledBackBy: undefined,
         rollbackReason: undefined,
+        // Tier 2 — approval workflow fields.
+        requiresApproval: input.requiresApproval ?? false,
+        requiredApprovers: input.requiredApprovers ?? null,
+        approvalStatus: input.requiresApproval ? "pending" : null,
+        approvals: [],
+        rejectionReason: null,
         createdAt: now,
       })
     );
+  }
+
+  async approveRelease(
+    releaseId: string,
+    approverId: string
+  ): Promise<Release> {
+    const release = await this.getRequiredRelease(releaseId);
+    const approvals = Array.isArray(release.approvals) ? [...release.approvals] : [];
+    if (!approvals.includes(approverId)) {
+      approvals.push(approverId);
+    }
+
+    let approvalStatus: Release["approvalStatus"] = release.approvalStatus ?? "pending";
+    const required = release.requiredApprovers ?? [];
+    if (required.length > 0) {
+      if (required.every((req) => approvals.includes(req))) {
+        approvalStatus = "approved";
+      }
+    } else if (approvals.length > 0) {
+      approvalStatus = "approved";
+    }
+
+    await this.repositories.Release.update(
+      { id: releaseId },
+      { approvals, approvalStatus }
+    );
+    await this.addHistory({
+      action: "release.approved",
+      at: new Date(),
+      releaseId,
+      by: approverId,
+    });
+    return (await this.getRequiredRelease(releaseId));
+  }
+
+  async rejectRelease(
+    releaseId: string,
+    rejectorId: string,
+    reason?: string
+  ): Promise<Release> {
+    await this.getRequiredRelease(releaseId);
+    await this.repositories.Release.update(
+      { id: releaseId },
+      { approvalStatus: "rejected", rejectionReason: reason ?? null }
+    );
+    await this.addHistory({
+      action: "release.rejected",
+      at: new Date(),
+      releaseId,
+      by: rejectorId,
+      reason,
+    });
+    return (await this.getRequiredRelease(releaseId));
   }
 
   async getRelease(releaseId: string): Promise<Release | null> {
@@ -829,8 +945,90 @@ export class RepositoryDbAdapter implements DbAdapter {
     );
   }
 
+  // ── Exclusion Layers ─────────────────────────────────────────────────
+  // Optional repository — these methods throw a clear, actionable error
+  // when the `ExclusionLayer` repository isn't provided. The manager
+  // surfaces this as a ValidationError to the caller.
+
+  async createExclusionLayer(input: ExclusionLayer): Promise<ExclusionLayer> {
+    const repo = this.requireExclusionRepo();
+    const existing = await repo.findOne({ key: input.key });
+    if (existing) throw new FlagConflictError(input.key, "exclusion layer");
+    await repo.create({
+      key: input.key,
+      description: input.description ?? null,
+      flagKeys: input.flagKeys,
+      allocations: input.allocations,
+    });
+    return input;
+  }
+
+  async getExclusionLayer(key: string): Promise<ExclusionLayer | null> {
+    if (!this.repositories.ExclusionLayer) return null;
+    const row = await this.repositories.ExclusionLayer.findOne({ key });
+    return row ? toExclusionLayer(row) : null;
+  }
+
+  async updateExclusionLayer(
+    key: string,
+    allocations: ExclusionLayerAllocation[]
+  ): Promise<ExclusionLayer> {
+    const repo = this.requireExclusionRepo();
+    const row = await repo.findOne({ key });
+    if (!row) {
+      throw new ValidationError(`Exclusion layer "${key}" not found`, {
+        exclusionLayer: key,
+      });
+    }
+    await repo.update({ key }, { allocations });
+    const updated = await repo.findOne({ key });
+    return toExclusionLayer(updated!);
+  }
+
+  async deleteExclusionLayer(key: string): Promise<void> {
+    const repo = this.requireExclusionRepo();
+    const row = await repo.findOne({ key });
+    if (!row) {
+      throw new ValidationError(`Exclusion layer "${key}" not found`, {
+        exclusionLayer: key,
+      });
+    }
+    await repo.delete({ key });
+  }
+
+  async listExclusionLayers(): Promise<ExclusionLayer[]> {
+    if (!this.repositories.ExclusionLayer) return [];
+    const rows = await this.repositories.ExclusionLayer.findMany();
+    return rows.map(toExclusionLayer);
+  }
+
+  // ── Stale Flag Detection ─────────────────────────────────────────────
+
+  async touchFlagEvaluation(key: string): Promise<void> {
+    // Best-effort: never throws so callers can safely fire-and-forget.
+    try {
+      await this.repositories.Flag.update(
+        { key },
+        { lastEvaluatedAt: new Date() }
+      );
+    } catch {
+      // swallow — touch is a hint, not load-bearing.
+    }
+  }
+
   async close(): Promise<void> {
     await this.closeHandler?.();
+  }
+
+  private requireExclusionRepo(): RowRepository {
+    const repo = this.repositories.ExclusionLayer;
+    if (!repo) {
+      throw new ValidationError(
+        "Exclusion layers require an 'ExclusionLayer' repository — register one in your adapter.",
+        { repository: "ExclusionLayer" }
+      );
+    }
+    return repo;
   }
 
   private async getRequiredRelease(releaseId: string): Promise<Release> {
@@ -846,6 +1044,21 @@ export function validateRepositorySet(repositories: Partial<RepositorySet>): voi
     if (!repository) {
       throw new ValidationError(`Missing repository "${name}"`, { repository: name });
     }
+    for (const method of ["create", "findOne", "findMany", "update", "delete", "deleteMany"] as const) {
+      if (typeof repository[method] !== "function") {
+        throw new ValidationError(`Repository "${name}" is missing method "${method}"`, {
+          repository: name,
+          method,
+        });
+      }
+    }
+  }
+  // Optional repositories are validated only when present — keeps the
+  // adapter constructor backwards-compatible with users who don't yet have
+  // an ExclusionLayer table.
+  for (const name of ROLLEASE_OPTIONAL_REPOSITORY_NAMES) {
+    const repository = repositories[name];
+    if (!repository) continue;
     for (const method of ["create", "findOne", "findMany", "update", "delete", "deleteMany"] as const) {
       if (typeof repository[method] !== "function") {
         throw new ValidationError(`Repository "${name}" is missing method "${method}"`, {
@@ -875,6 +1088,15 @@ export function toFlag(row: unknown): Flag {
     rollout: data.rollout as Flag["rollout"],
     scheduledAt: nullableDate(data.scheduledAt),
     expiresAt: nullableDate(data.expiresAt),
+    prerequisites: arrayOrUndefined<FlagPrerequisite>(data.prerequisites),
+    environmentDefaults:
+      data.environmentDefaults &&
+      typeof data.environmentDefaults === "object" &&
+      !Array.isArray(data.environmentDefaults)
+        ? (data.environmentDefaults as Record<string, unknown>)
+        : undefined,
+    exclusionLayer: optionalString(data.exclusionLayer),
+    lastEvaluatedAt: nullableDate(data.lastEvaluatedAt),
     createdAt: date(data.createdAt),
     updatedAt: date(data.updatedAt),
   };
@@ -893,6 +1115,23 @@ export function toRule(row: unknown): FlagRule {
     rolloutPct: optionalNumber(data.rolloutPct),
     isHoldout: optionalBoolean(data.isHoldout),
     variantId: optionalString(data.variantId),
+    userIds: arrayOrUndefined<string>(data.userIds),
+    description: optionalString(data.description),
+    metadata:
+      data.metadata && typeof data.metadata === "object" && !Array.isArray(data.metadata)
+        ? (data.metadata as Record<string, unknown>)
+        : undefined,
+  };
+}
+
+export function toExclusionLayer(row: unknown): ExclusionLayer {
+  const data = plain(row);
+  return {
+    key: String(data.key),
+    description: optionalString(data.description),
+    flagKeys: arrayOrUndefined<string>(data.flagKeys) ?? [],
+    allocations:
+      (arrayOrUndefined<ExclusionLayerAllocation>(data.allocations) ?? []),
   };
 }
 
@@ -923,6 +1162,18 @@ export function toRelease(row: unknown): Release {
     rolledBackAt: nullableDate(data.rolledBackAt),
     rolledBackBy: optionalString(data.rolledBackBy),
     rollbackReason: optionalString(data.rollbackReason),
+    requiresApproval: data.requiresApproval === undefined
+      ? undefined
+      : Boolean(data.requiresApproval),
+    requiredApprovers: arrayOrUndefined<string>(data.requiredApprovers),
+    approvalStatus:
+      data.approvalStatus === "pending" ||
+      data.approvalStatus === "approved" ||
+      data.approvalStatus === "rejected"
+        ? data.approvalStatus
+        : undefined,
+    approvals: arrayOrUndefined<string>(data.approvals),
+    rejectionReason: optionalString(data.rejectionReason),
     createdAt: date(data.createdAt),
   };
 }

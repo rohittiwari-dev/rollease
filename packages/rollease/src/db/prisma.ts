@@ -5,15 +5,17 @@
 import { ValidationError } from "../core/errors";
 import {
   RepositoryDbAdapter,
+  ROLLEASE_OPTIONAL_REPOSITORY_NAMES,
   ROLLEASE_REPOSITORY_NAMES,
   ROLLEASE_REPOSITORY_REQUIRED_COLUMNS,
+  type AnyRepositoryName,
   type RepositoryFindManyOptions,
   type RepositoryName,
   type RepositorySet,
   type RowRepository,
 } from "./repository";
 
-export type PrismaAdapterModelName = RepositoryName;
+export type PrismaAdapterModelName = AnyRepositoryName;
 
 export interface PrismaDelegateLike {
   create(args: { data: Record<string, unknown> }): Promise<unknown>;
@@ -72,6 +74,7 @@ export const ROLLEASE_PRISMA_DEFAULT_DELEGATES: Record<
   Assignment: "rolleaseAssignment",
   History: "rolleaseHistory",
   Impression: "rolleaseImpression",
+  ExclusionLayer: "rolleaseExclusionLayer",
 };
 
 export const ROLLEASE_PRISMA_DEFAULT_MODELS: Record<
@@ -85,6 +88,7 @@ export const ROLLEASE_PRISMA_DEFAULT_MODELS: Record<
   Assignment: "RolleaseAssignment",
   History: "RolleaseHistory",
   Impression: "RolleaseImpression",
+  ExclusionLayer: "RolleaseExclusionLayer",
 };
 
 export const ROLLEASE_PRISMA_REQUIRED_FIELDS = ROLLEASE_REPOSITORY_REQUIRED_COLUMNS;
@@ -113,13 +117,19 @@ export function createPrismaAdapter(options: PrismaAdapterOptions): PrismaDbAdap
 }
 
 export function validatePrismaDelegates(options: PrismaAdapterOptions): void {
-  for (const name of ROLLEASE_REPOSITORY_NAMES) {
+  const validate = (
+    name: PrismaAdapterModelName,
+    required: boolean
+  ): void => {
     const delegate = resolvePrismaDelegate(options, name);
     if (!delegate) {
-      throw new ValidationError(`Missing Prisma delegate for Rollease model "${name}"`, {
-        model: name,
-        delegate: getPrismaDelegateName(options, name),
-      });
+      if (required) {
+        throw new ValidationError(`Missing Prisma delegate for Rollease model "${name}"`, {
+          model: name,
+          delegate: getPrismaDelegateName(options, name),
+        });
+      }
+      return; // optional and absent — skip silently
     }
 
     const missing: string[] = [];
@@ -150,7 +160,10 @@ export function validatePrismaDelegates(options: PrismaAdapterOptions): void {
         missingMethods: missing,
       });
     }
-  }
+  };
+
+  for (const name of ROLLEASE_REPOSITORY_NAMES) validate(name, true);
+  for (const name of ROLLEASE_OPTIONAL_REPOSITORY_NAMES) validate(name, false);
 }
 
 export function validatePrismaModelFields(options: PrismaAdapterOptions): void {
@@ -162,15 +175,18 @@ export function validatePrismaModelFields(options: PrismaAdapterOptions): void {
     );
   }
 
-  for (const name of ROLLEASE_REPOSITORY_NAMES) {
+  const validate = (name: PrismaAdapterModelName, required: boolean): void => {
     const modelName =
       options.modelNames?.[name] ?? ROLLEASE_PRISMA_DEFAULT_MODELS[name];
     const model = models[modelName];
     if (!model) {
-      throw new ValidationError(`Missing Prisma model metadata "${modelName}"`, {
-        model: name,
-        prismaModel: modelName,
-      });
+      if (required) {
+        throw new ValidationError(`Missing Prisma model metadata "${modelName}"`, {
+          model: name,
+          prismaModel: modelName,
+        });
+      }
+      return;
     }
 
     const fieldNames = getPrismaFieldNames(model.fields);
@@ -183,22 +199,36 @@ export function validatePrismaModelFields(options: PrismaAdapterOptions): void {
         { model: name, prismaModel: modelName, missingFields: missing }
       );
     }
-  }
+  };
+
+  for (const name of ROLLEASE_REPOSITORY_NAMES) validate(name, true);
+  for (const name of ROLLEASE_OPTIONAL_REPOSITORY_NAMES) validate(name, false);
 }
 
 function createPrismaRepositories(options: PrismaAdapterOptions): RepositorySet {
-  return Object.fromEntries(
-    ROLLEASE_REPOSITORY_NAMES.map((name) => {
-      const delegate = resolvePrismaDelegate(options, name);
-      if (!delegate) {
-        throw new ValidationError(`Missing Prisma delegate for Rollease model "${name}"`, {
-          model: name,
-          delegate: getPrismaDelegateName(options, name),
-        });
-      }
-      return [name, createPrismaRepository(name, delegate)];
-    })
-  ) as RepositorySet;
+  const entries: Array<[PrismaAdapterModelName, RowRepository]> = [];
+
+  for (const name of ROLLEASE_REPOSITORY_NAMES) {
+    const delegate = resolvePrismaDelegate(options, name);
+    if (!delegate) {
+      throw new ValidationError(`Missing Prisma delegate for Rollease model "${name}"`, {
+        model: name,
+        delegate: getPrismaDelegateName(options, name),
+      });
+    }
+    entries.push([name, createPrismaRepository(name, delegate)]);
+  }
+
+  // Optional delegates — wire only when present so existing schemas keep
+  // working unchanged.
+  for (const name of ROLLEASE_OPTIONAL_REPOSITORY_NAMES) {
+    const delegate = resolvePrismaDelegate(options, name);
+    if (delegate) {
+      entries.push([name, createPrismaRepository(name, delegate)]);
+    }
+  }
+
+  return Object.fromEntries(entries) as RepositorySet;
 }
 
 function createPrismaRepository(

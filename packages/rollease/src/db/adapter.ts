@@ -21,6 +21,8 @@ import type {
   ReleaseChange,
   FlagStatus,
   SegmentUsage,
+  ExclusionLayer,
+  ExclusionLayerAllocation,
 } from "../core/types";
 
 /**
@@ -123,6 +125,27 @@ export interface DbAdapter {
   /** Mark a release as rolled back and revert all its changes. */
   rollbackRelease(releaseId: string, rolledBackBy?: string, reason?: string): Promise<void>;
 
+  /** Approve a release by appending the approver. */
+  approveRelease?(releaseId: string, approverId: string): Promise<Release>;
+
+  /** Reject a release with an optional reason. */
+  rejectRelease?(releaseId: string, rejectorId: string, reason?: string): Promise<Release>;
+
+  /** Create a new exclusion layer. */
+  createExclusionLayer?(input: ExclusionLayer): Promise<ExclusionLayer>;
+
+  /** Get an exclusion layer by key. */
+  getExclusionLayer?(key: string): Promise<ExclusionLayer | null>;
+
+  /** Update an exclusion layer's allocations. */
+  updateExclusionLayer?(key: string, allocations: ExclusionLayerAllocation[]): Promise<ExclusionLayer>;
+
+  /** Delete an exclusion layer. */
+  deleteExclusionLayer?(key: string): Promise<void>;
+
+  /** List all exclusion layers. */
+  listExclusionLayers?(): Promise<ExclusionLayer[]>;
+
   // ── Sticky Assignments ───────────────────────────────────────────────
 
   /** Get a user's sticky variant assignment for a flag. */
@@ -181,6 +204,11 @@ export interface DbAdapter {
 
   /** Remove tags from a flag. */
   removeTags(flagKey: string, tags: string[]): Promise<void>;
+
+  // ── Stale Flag Detection ──────────────────────────────────────────────
+
+  /** Update the lastEvaluatedAt timestamp for a flag (fire-and-forget). */
+  touchFlagEvaluation?(key: string): Promise<void>;
 
   // ── Lifecycle ────────────────────────────────────────────────────────
 

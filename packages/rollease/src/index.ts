@@ -35,6 +35,7 @@ export type {
   DetailedFlagMap,
   Variant,
   FlagVariantDef,
+  FlagPrerequisite,
   EvalReason,
 
   // Rollout
@@ -84,6 +85,21 @@ export type {
   RollbackReleaseInput,
   CloneFlagInput,
 
+  // Bulk operations
+  BulkCreateResult,
+  BulkUpdateResult,
+
+  // Webhooks
+  WebhookConfig,
+  WebhookPayload,
+
+  // Multi-Context
+  MultiContext,
+
+  // Exclusion Layers
+  ExclusionLayer,
+  ExclusionLayerAllocation,
+
   // GeoIP
   GeoContext,
   GeoIPAdapter,
@@ -125,6 +141,7 @@ export {
 export { createLogger, noopLogger } from "./core/logger";
 export type { RolleaseLogger } from "./core/logger";
 export { INTERNAL_SECRET } from "./core/internal";
+export { WebhookDispatcher, verifyWebhookSignature } from "./core/webhook";
 
 // ── Database Adapters ──────────────────────────────────────────────────────
 export type { DbAdapter, CacheAdapter } from "./db/adapter";
@@ -243,6 +260,8 @@ export function createRollease(config: RolleaseConfig): RolleaseClient {
     logger,
     evaluateAllPageSize: config.evaluateAllPageSize,
     autoResolveSegments: config.autoResolveSegments,
+    webhooks: config.webhooks,
+    environment: config.environment,
   });
 
   // Capture the secret in a closure so it never appears on the public client

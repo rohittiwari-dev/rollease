@@ -39,6 +39,10 @@ export interface RolleaseConfig {
    * Default: false (opt-in for backward compatibility).
    */
   autoResolveSegments?: boolean;
+  /** Webhook configurations for flag change notifications */
+  webhooks?: WebhookConfig[];
+  /** Environment name — filters all flag operations to this environment */
+  environment?: string;
 }
 
 export interface ImpressionConfig {
@@ -177,8 +181,31 @@ export interface Flag {
   scheduledAt?: Date | string | null;
   /** Auto-deactivation date */
   expiresAt?: Date | string | null;
+  /**
+   * Flag prerequisites — this flag only evaluates if ALL prerequisites
+   * return their required variation. Prevents enabling features without
+   * their dependencies.
+   */
+  prerequisites?: FlagPrerequisite[];
+  /** Per-environment default value overrides (e.g. { production: false, staging: true }) */
+  environmentDefaults?: Record<string, unknown>;
+  /** Last time this flag was evaluated (set by touchFlagEvaluation) */
+  lastEvaluatedAt?: Date | null;
+  /** Exclusion layer key this flag belongs to */
+  exclusionLayer?: string;
   createdAt: Date;
   updatedAt: Date;
+}
+
+/**
+ * A prerequisite relationship. The prerequisite flag must evaluate to the
+ * specified variation before this flag's rules are considered.
+ */
+export interface FlagPrerequisite {
+  /** Key of the prerequisite flag */
+  flagKey: string;
+  /** Required value — prerequisite must evaluate to this value */
+  variation: unknown;
 }
 
 // ── Variants ───────────────────────────────────────────────────────────────
@@ -238,6 +265,12 @@ export interface FlagRule {
   isHoldout?: boolean;
   /** Specific variant ID to assign (for multivariate flags) */
   variantId?: string;
+  /** Explicit user allow-list — if set, rule only matches these users */
+  userIds?: string[];
+  /** Human-readable description of what this rule does */
+  description?: string;
+  /** Arbitrary metadata (e.g. ticket ID, owner, created date) */
+  metadata?: Record<string, unknown>;
 }
 
 export type FlagDimensionKey =
@@ -305,6 +338,9 @@ export type EvalReason =
   | "disabled"
   | "expired"
   | "not_scheduled"
+  | "prerequisite_not_met"
+  | "exclusion_group_miss"
+  | "exclusion_layer_not_found"
   | "override"
   | "assignment"
   | "rule_match"
@@ -347,6 +383,11 @@ export interface Release {
   rolledBackAt?: Date | null;
   rolledBackBy?: string;
   rollbackReason?: string;
+  requiresApproval?: boolean;
+  requiredApprovers?: string[];
+  approvalStatus?: "pending" | "approved" | "rejected";
+  approvals?: string[];
+  rejectionReason?: string;
   createdAt: Date;
 }
 
@@ -403,6 +444,8 @@ export type HistoryAction =
   | "variant.updated"
   | "release.deployed"
   | "release.rolled_back"
+  | "release.approved"
+  | "release.rejected"
   | "segment.created"
   | "segment.updated"
   | "segment.deleted"
@@ -465,6 +508,12 @@ export interface CreateFlagInput {
   rollout?: RolloutConfig;
   scheduledAt?: string | null;
   expiresAt?: string | null;
+  /** Flag prerequisites (Flag B only evaluates if Flag A returns variation X) */
+  prerequisites?: FlagPrerequisite[];
+  /** Per-environment default value overrides */
+  environmentDefaults?: Record<string, unknown>;
+  /** Exclusion layer key this flag belongs to */
+  exclusionLayer?: string;
   actor?: AuditActor;
 }
 
@@ -482,6 +531,8 @@ export interface UpdateFlagInput {
   environments?: string[];
   scheduledAt?: string | null;
   expiresAt?: string | null;
+  /** Exclusion layer key this flag belongs to */
+  exclusionLayer?: string;
   actor?: AuditActor;
 }
 
@@ -497,6 +548,8 @@ export interface ListFlagsInput {
   status?: FlagStatus;
   environment?: string;
   search?: string;
+  /** Only return flags not evaluated since this ISO date (stale flag detection) */
+  staleAfter?: string;
   limit?: number;
   offset?: number;
 }
@@ -516,6 +569,12 @@ export interface AddRuleInput {
   rolloutPct?: number;
   isHoldout?: boolean;
   variantId?: string;
+  /** Explicit user allow-list — if set, rule only matches these users */
+  userIds?: string[];
+  /** Human-readable description of what this rule does */
+  description?: string;
+  /** Arbitrary metadata (e.g. ticket ID, owner) */
+  metadata?: Record<string, unknown>;
   actor?: AuditActor;
 }
 
@@ -528,6 +587,12 @@ export interface UpdateRuleInput {
   rolloutPct?: number;
   isHoldout?: boolean;
   variantId?: string;
+  /** Explicit user allow-list — if set, rule only matches these users */
+  userIds?: string[];
+  /** Human-readable description of what this rule does */
+  description?: string;
+  /** Arbitrary metadata (e.g. ticket ID, owner) */
+  metadata?: Record<string, unknown>;
   actor?: AuditActor;
 }
 
@@ -555,6 +620,8 @@ export interface CreateReleaseInput {
   environment?: string;
   changes: ReleaseChange[];
   scheduledAt?: string | null;
+  requiresApproval?: boolean;
+  requiredApprovers?: string[];
   actor?: AuditActor;
 }
 
@@ -593,3 +660,54 @@ export interface CloneFlagInput {
   includeRollout?: boolean;
   actor?: AuditActor;
 }
+
+// ── Bulk Operations ────────────────────────────────────────────────────────
+
+export interface BulkCreateResult {
+  created: Flag[];
+  errors: Array<{ key: string; error: string }>;
+}
+
+export interface BulkUpdateResult {
+  updated: Flag[];
+  errors: Array<{ key: string; error: string }>;
+}
+
+// ── Webhooks ───────────────────────────────────────────────────────────────
+
+export interface WebhookConfig {
+  url: string;
+  secret?: string; // HMAC signing secret
+  events?: HistoryAction[]; // Default: all
+  headers?: Record<string, string>;
+}
+
+export interface WebhookPayload {
+  event: HistoryAction;
+  flagKey?: string;
+  timestamp: string;
+  data: Record<string, unknown>;
+}
+
+// ── Multi-Context Evaluation ────────────────────────────────────────────────
+
+export interface MultiContext {
+  contexts: Record<string, FlagContext>;
+  primaryKey?: string; // Default to first context key
+}
+
+// ── Exclusion Layers ────────────────────────────────────────────────────────
+
+export interface ExclusionLayerAllocation {
+  flagKey: string;
+  startBucket: number; // 0..100
+  endBucket: number;   // 0..100
+}
+
+export interface ExclusionLayer {
+  key: string;
+  description?: string;
+  flagKeys: string[];
+  allocations: ExclusionLayerAllocation[];
+}
+
