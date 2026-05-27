@@ -76,7 +76,10 @@ export class RedisCacheAdapter implements CacheAdapter {
       throw new Error("Redis client must support scanIterator() for delPattern()");
     }
 
-    const fullPattern = this.key(pattern);
+    // Escape Redis glob special characters in the prefix portion to avoid
+    // unintended pattern matching (e.g. prefix containing `[` or `*`).
+    const escapedPrefix = this.keyPrefix.replace(/([*?[\]\\])/g, "\\$1");
+    const fullPattern = `${escapedPrefix}${pattern}`;
     const batch: string[] = [];
     for await (const key of client.scanIterator({
       MATCH: fullPattern,

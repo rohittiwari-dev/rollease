@@ -307,7 +307,11 @@ describe("Memory Database & Cache Adapters", () => {
       flag = await db.getFlag("flag");
       expect(flag?.status).toBe("active");
 
-      // Rollback advanced
+      // Snapshot-based rollback restores EXACT prior state (defaultValue,
+      // status, rollout). Capture state before relRollback runs so we can
+      // assert it gets restored.
+      const before = await db.getFlag("flag");
+
       const relRollback = await db.createRelease({
         name: "Rollback config",
         changes: [
@@ -319,8 +323,108 @@ describe("Memory Database & Cache Adapters", () => {
       await db.deployRelease(relRollback.id);
       await db.rollbackRelease(relRollback.id);
       flag = await db.getFlag("flag");
-      expect(flag?.defaultValue).toBe(true); // disable reversed to true
-      expect(flag?.status).toBe("killed"); // restore reversed to killed
+      expect(flag?.defaultValue).toBe(before?.defaultValue);
+      expect(flag?.status).toBe(before?.status);
+      expect(flag?.rollout?.percentage).toBe(before?.rollout?.percentage);
+    });
+
+    it("snapshot rollback restores setValue and setRollout changes exactly", async () => {
+      const db = new MemoryDbAdapter();
+      await db.createFlag({
+        key: "flag",
+        type: "string",
+        defaultValue: "v1-original",
+        rollout: { percentage: 25, sticky: true, hashKey: "userId" },
+      });
+
+      const rel = await db.createRelease({
+        name: "Major reconfigure",
+        changes: [
+          { flagKey: "flag", action: "setValue", value: "v2-new" },
+          { flagKey: "flag", action: "setRollout", rollout: { percentage: 100 } },
+        ],
+      });
+
+      await db.deployRelease(rel.id, "alice");
+      const deployed = await db.getFlag("flag");
+      expect(deployed?.defaultValue).toBe("v2-new");
+      expect(deployed?.rollout?.percentage).toBe(100);
+
+      // The snapshot must remember the original values (one per unique flag).
+      const release = await db.getRelease(rel.id);
+      expect(release?.snapshots?.length).toBe(1);
+
+      await db.rollbackRelease(rel.id, "bob", "regression");
+      const restored = await db.getFlag("flag");
+      expect(restored?.defaultValue).toBe("v1-original");
+      expect(restored?.rollout?.percentage).toBe(25);
+    });
+
+    it("getSegmentUsage does not false-positive on segment key appearing in unrelated string values", async () => {
+      const db = new MemoryDbAdapter();
+      await db.createFlag({ key: "flag-a", type: "boolean", defaultValue: false });
+      await db.createFlag({ key: "flag-b", type: "boolean", defaultValue: false });
+
+      // flag-a references the segment "user" via a userType value — NOT as
+      // a segment-dimension leaf. Should NOT show up in segment usage.
+      await db.addRule("flag-a", {
+        priority: 1,
+        value: true,
+        conditions: {
+          any: [{ dimension: "userType", op: "eq", value: "user" }],
+        },
+      });
+
+      // flag-b actually uses the segment.
+      const ruleB = await db.addRule("flag-b", {
+        priority: 1,
+        value: true,
+        conditions: {
+          any: [{ dimension: "segment", op: "in", value: "user" }],
+        },
+      });
+
+      const usage = await db.getSegmentUsage("user");
+      expect(usage).toEqual([{ flagKey: "flag-b", ruleId: ruleB.id }]);
+    });
+
+    it("getUserAssignments returns a batched map in one round-trip", async () => {
+      const db = new MemoryDbAdapter();
+      await db.createFlag({ key: "f1", type: "boolean", defaultValue: false });
+      await db.createFlag({ key: "f2", type: "boolean", defaultValue: false });
+      await db.createFlag({ key: "f3", type: "boolean", defaultValue: false });
+
+      await db.setUserAssignment("f1", "alice", "variant-a");
+      await db.setUserAssignment("f3", "alice", "variant-c");
+
+      const batched = await db.getUserAssignments(["f1", "f2", "f3"], "alice");
+      expect(batched).toEqual({ f1: "variant-a", f3: "variant-c" });
+
+      // Empty input shortcuts.
+      expect(await db.getUserAssignments([], "alice")).toEqual({});
+    });
+
+    it("getAllActiveFlags supports limit/offset pagination", async () => {
+      const db = new MemoryDbAdapter();
+      for (let i = 0; i < 5; i++) {
+        await db.createFlag({
+          key: `flag-${i}`,
+          type: "boolean",
+          defaultValue: false,
+        });
+      }
+
+      const page1 = await db.getAllActiveFlags({ limit: 2, offset: 0 });
+      const page2 = await db.getAllActiveFlags({ limit: 2, offset: 2 });
+      const page3 = await db.getAllActiveFlags({ limit: 2, offset: 4 });
+
+      expect(page1.length).toBe(2);
+      expect(page2.length).toBe(2);
+      expect(page3.length).toBe(1);
+
+      // Keys should not overlap across pages.
+      const allKeys = [...page1, ...page2, ...page3].map((f) => f.key);
+      expect(new Set(allKeys).size).toBe(5);
     });
 
     it("should manage user assignments, impressions, history, and active flags resolution", async () => {

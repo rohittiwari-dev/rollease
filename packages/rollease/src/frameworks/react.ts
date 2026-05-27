@@ -43,6 +43,7 @@ export function RolleaseProvider({ initialFlags, children }: RolleaseProviderPro
 
     const flags: FlagMap = {};
     const flagDetails: Record<string, FlagResult> = {};
+    const now = new Date();
 
     for (const [key, val] of Object.entries(initialFlags)) {
       if (val && typeof val === "object" && "reason" in val && "evaluatedAt" in val) {
@@ -60,7 +61,7 @@ export function RolleaseProvider({ initialFlags, children }: RolleaseProviderPro
           enabled: Boolean(val),
           reason: "default" as EvalReason,
           ruleId: null,
-          evaluatedAt: new Date(),
+          evaluatedAt: now,
         };
       }
     }

@@ -15,6 +15,8 @@ export default defineConfig({
     "core/types": "src/core/types.ts",
     "core/errors": "src/core/errors.ts",
     "core/security": "src/core/security.ts",
+    "core/logger": "src/core/logger.ts",
+    "core/internal": "src/core/internal.ts",
     "engine/evaluator": "src/engine/evaluator.ts",
     "engine/manager": "src/engine/manager.ts",
   },

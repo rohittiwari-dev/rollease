@@ -9,6 +9,7 @@ import type {
   FlagRule,
   Segment,
   Release,
+  ReleaseSnapshot,
   HistoryEntry,
   CreateFlagInput,
   UpdateFlagInput,
@@ -16,6 +17,7 @@ import type {
   ListFlagsResult,
   AddRuleInput,
   UpdateRuleInput,
+  RuleOrdering,
   CreateSegmentInput,
   UpdateSegmentInput,
   CreateReleaseInput,
@@ -29,18 +31,17 @@ import {
   SegmentNotFoundError,
   ReleaseNotFoundError,
 } from "../core/errors";
-import { assertSafeConditionGroup } from "../core/security";
-
-let counter = 0;
-function genId(prefix: string = "id"): string {
-  return `${prefix}_${++counter}_${Date.now().toString(36)}`;
-}
+import {
+  assertSafeConditionGroup,
+  conditionReferencesSegment,
+} from "../core/security";
 
 /**
  * In-memory database adapter. All data is stored in Maps and lost on process restart.
  * Use for development, testing, and prototyping.
  */
 export class MemoryDbAdapter implements DbAdapter {
+  private idCounter = 0;
   private flags = new Map<string, Flag>();
   private rules = new Map<string, FlagRule[]>(); // flagKey → rules
   private segments = new Map<string, Segment>();
@@ -48,6 +49,10 @@ export class MemoryDbAdapter implements DbAdapter {
   private assignments = new Map<string, string>(); // `${flagKey}:${userId}` → variantKey
   private history: HistoryEntry[] = [];
   private impressions: Array<Record<string, unknown>> = [];
+
+  private genId(prefix: string = "id"): string {
+    return `${prefix}_${++this.idCounter}_${Date.now().toString(36)}`;
+  }
 
   // ── Flag CRUD ────────────────────────────────────────────────────────
 
@@ -58,7 +63,7 @@ export class MemoryDbAdapter implements DbAdapter {
 
     const now = new Date();
     const flag: Flag = {
-      id: genId("flag"),
+      id: this.genId("flag"),
       key: input.key,
       type: input.type,
       status: "active",
@@ -68,7 +73,7 @@ export class MemoryDbAdapter implements DbAdapter {
       tags: input.tags || [],
       locked: false,
       environments: input.environments,
-      variants: input.variants?.map((v) => ({ ...v, id: genId("var") })),
+      variants: input.variants?.map((v) => ({ ...v, id: this.genId("var") })),
       rollout: input.rollout,
       scheduledAt: input.scheduledAt || null,
       expiresAt: input.expiresAt || null,
@@ -154,8 +159,12 @@ export class MemoryDbAdapter implements DbAdapter {
       type: flag.type,
       status: flag.status,
       createdAt: flag.createdAt,
-      variants: flag.variants,
-      rollout: flag.rollout,
+      variants: (input as Record<string, unknown>).variants !== undefined
+        ? (input as Record<string, unknown>).variants as Flag["variants"]
+        : flag.variants,
+      rollout: (input as Record<string, unknown>).rollout !== undefined
+        ? (input as Record<string, unknown>).rollout as Flag["rollout"]
+        : flag.rollout,
     };
 
     // Merge tags if provided
@@ -220,13 +229,13 @@ export class MemoryDbAdapter implements DbAdapter {
     const now = new Date();
     const cloned: Flag = {
       ...source,
-      id: genId("flag"),
+      id: this.genId("flag"),
       key: newKey,
       status: "active",
       locked: false,
       lockedReason: undefined,
       rollout: includeRollout ? source.rollout : undefined,
-      variants: source.variants?.map((v) => ({ ...v, id: genId("var") })),
+      variants: source.variants?.map((v) => ({ ...v, id: this.genId("var") })),
       createdAt: now,
       updatedAt: now,
     };
@@ -238,7 +247,7 @@ export class MemoryDbAdapter implements DbAdapter {
       const sourceRules = this.rules.get(sourceKey) || [];
       const clonedRules = sourceRules.map((r) => ({
         ...r,
-        id: genId("rule"),
+        id: this.genId("rule"),
         flagKey: newKey,
       }));
       this.rules.set(newKey, clonedRules);
@@ -291,7 +300,7 @@ export class MemoryDbAdapter implements DbAdapter {
     assertSafeConditionGroup(input.conditions, "rule.conditions");
 
     const rule: FlagRule = {
-      id: genId("rule"),
+      id: this.genId("rule"),
       flagKey,
       name: input.name,
       priority: input.priority,
@@ -372,7 +381,7 @@ export class MemoryDbAdapter implements DbAdapter {
 
   async reorderRules(
     flagKey: string,
-    ordering: { ruleId: string; priority: number }[]
+    ordering: RuleOrdering[]
   ): Promise<void> {
     const rules = this.rules.get(flagKey);
     if (!rules) throw new FlagNotFoundError(flagKey);
@@ -447,8 +456,7 @@ export class MemoryDbAdapter implements DbAdapter {
 
     for (const [flagKey, rules] of this.rules) {
       for (const rule of rules) {
-        const json = JSON.stringify(rule.conditions);
-        if (json.includes(key)) {
+        if (conditionReferencesSegment(rule.conditions, key)) {
           usage.push({ flagKey, ruleId: rule.id });
         }
       }
@@ -462,7 +470,7 @@ export class MemoryDbAdapter implements DbAdapter {
   async createRelease(input: CreateReleaseInput): Promise<Release> {
     const now = new Date();
     const release: Release = {
-      id: genId("rel"),
+      id: this.genId("rel"),
       name: input.name,
       description: input.description,
       environment: input.environment,
@@ -513,10 +521,28 @@ export class MemoryDbAdapter implements DbAdapter {
     const release = this.releases.get(releaseId);
     if (!release) throw new ReleaseNotFoundError(releaseId);
 
-    // Apply each change
+    const snapshots: ReleaseSnapshot[] = [];
+    const snapshotted = new Set<string>();
+
     for (const change of release.changes) {
       const flag = this.flags.get(change.flagKey);
       if (!flag) continue;
+
+      // Capture before-state so rollback can restore exact prior value.
+      // Only snapshot the first time we encounter this flag — subsequent
+      // changes to the same flag within this release should not overwrite
+      // the original pre-deployment state.
+      if (!snapshotted.has(change.flagKey)) {
+        snapshotted.add(change.flagKey);
+        snapshots.push({
+          flagKey: change.flagKey,
+          beforeValue: flag.defaultValue,
+          beforeStatus: flag.status,
+          beforeRollout: flag.rollout
+            ? { ...flag.rollout, rampSchedule: flag.rollout.rampSchedule?.slice() }
+            : undefined,
+        });
+      }
 
       switch (change.action) {
         case "enable":
@@ -554,6 +580,7 @@ export class MemoryDbAdapter implements DbAdapter {
     release.status = "deployed";
     release.deployedAt = new Date();
     release.deployedBy = deployedBy;
+    release.snapshots = snapshots;
     this.releases.set(releaseId, release);
 
     await this.addHistory({
@@ -572,30 +599,41 @@ export class MemoryDbAdapter implements DbAdapter {
     const release = this.releases.get(releaseId);
     if (!release) throw new ReleaseNotFoundError(releaseId);
 
-    // Reverse each change
-    for (const change of release.changes) {
-      const flag = this.flags.get(change.flagKey);
-      if (!flag) continue;
-
-      switch (change.action) {
-        case "enable":
-          flag.defaultValue = false;
-          break;
-        case "disable":
-          flag.defaultValue = true;
-          break;
-        case "kill":
-          flag.status = "active";
-          break;
-        case "restore":
-          flag.status = "killed";
-          break;
-        // setValue and setRollout are harder to reverse without snapshots
-        // In production, we'd store before-snapshots
+    if (release.snapshots && release.snapshots.length > 0) {
+      // Snapshot-driven rollback — exact restoration of prior state.
+      for (const snap of release.snapshots) {
+        const flag = this.flags.get(snap.flagKey);
+        if (!flag) continue;
+        flag.defaultValue = snap.beforeValue;
+        flag.status = snap.beforeStatus;
+        flag.rollout = snap.beforeRollout
+          ? { ...snap.beforeRollout, rampSchedule: snap.beforeRollout.rampSchedule?.slice() }
+          : undefined;
+        flag.updatedAt = new Date();
+        this.flags.set(snap.flagKey, flag);
       }
-
-      flag.updatedAt = new Date();
-      this.flags.set(change.flagKey, flag);
+    } else {
+      // Legacy fallback for releases deployed before snapshots existed.
+      for (const change of release.changes) {
+        const flag = this.flags.get(change.flagKey);
+        if (!flag) continue;
+        switch (change.action) {
+          case "enable":
+            flag.defaultValue = false;
+            break;
+          case "disable":
+            flag.defaultValue = true;
+            break;
+          case "kill":
+            flag.status = "active";
+            break;
+          case "restore":
+            flag.status = "killed";
+            break;
+        }
+        flag.updatedAt = new Date();
+        this.flags.set(change.flagKey, flag);
+      }
     }
 
     release.status = "rolled_back";
@@ -619,6 +657,18 @@ export class MemoryDbAdapter implements DbAdapter {
     return this.assignments.get(`${flagKey}:${userId}`) || null;
   }
 
+  async getUserAssignments(
+    flagKeys: string[],
+    userId: string
+  ): Promise<Record<string, string>> {
+    const out: Record<string, string> = {};
+    for (const key of flagKeys) {
+      const v = this.assignments.get(`${key}:${userId}`);
+      if (v) out[key] = v;
+    }
+    return out;
+  }
+
   async setUserAssignment(
     flagKey: string,
     userId: string,
@@ -630,7 +680,7 @@ export class MemoryDbAdapter implements DbAdapter {
   // ── History ──────────────────────────────────────────────────────────
 
   async addHistory(entry: Omit<HistoryEntry, "id">): Promise<void> {
-    this.history.push({ ...entry, id: genId("hist") });
+    this.history.push({ ...entry, id: this.genId("hist") });
   }
 
   async getHistory(
@@ -663,6 +713,8 @@ export class MemoryDbAdapter implements DbAdapter {
     namespace?: string;
     tags?: string[];
     keys?: string[];
+    limit?: number;
+    offset?: number;
   }): Promise<Flag[]> {
     let flags = Array.from(this.flags.values()).filter((f) => f.status === "active");
 
@@ -682,10 +734,14 @@ export class MemoryDbAdapter implements DbAdapter {
       flags = flags.filter((f) => opts.keys!.includes(f.key));
     }
 
-    // Attach rules to each flag for evaluation
-    return flags.map((f) => ({
-      ...f,
-    }));
+    const offset = opts?.offset ?? 0;
+    if (opts?.limit !== undefined) {
+      flags = flags.slice(offset, offset + opts.limit);
+    } else if (offset > 0) {
+      flags = flags.slice(offset);
+    }
+
+    return flags.map((f) => ({ ...f }));
   }
 
   // ── Tags ─────────────────────────────────────────────────────────────

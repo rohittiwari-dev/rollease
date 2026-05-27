@@ -6,6 +6,8 @@ import { FlagManager } from "./engine/manager";
 import { MemoryCacheAdapter } from "./db/memory";
 import { RedisCacheAdapter } from "./db/redis";
 import { ValidationError } from "./core/errors";
+import { createLogger } from "./core/logger";
+import { INTERNAL_SECRET } from "./core/internal";
 import type { RolleaseConfig } from "./core/types";
 import type { CacheAdapter } from "./db/adapter";
 
@@ -16,6 +18,11 @@ export type {
   CacheConfig,
   AuditConfig,
   AuditSink,
+  AuditActor,
+  RolleaseHooks,
+  LoggingConfig,
+  LogLevel,
+  ImpressionConfig,
 
   // Flag types
   Flag,
@@ -49,6 +56,7 @@ export type {
   Release,
   ReleaseChange,
   ReleasePreview,
+  ReleaseSnapshot,
   ReleaseStatus,
   ReleaseAction,
 
@@ -60,6 +68,7 @@ export type {
   // Inputs
   CreateFlagInput,
   UpdateFlagInput,
+  SetLockInput,
   ListFlagsInput,
   ListFlagsResult,
   AddRuleInput,
@@ -95,7 +104,7 @@ export {
 } from "./core/errors";
 
 // ── Engine ─────────────────────────────────────────────────────────────────
-export { evaluateFlag } from "./engine/evaluator";
+export { evaluateFlag, evaluateConditionGroup } from "./engine/evaluator";
 export { FlagManager } from "./engine/manager";
 
 // ── Utilities ──────────────────────────────────────────────────────────────
@@ -106,7 +115,16 @@ export {
   safeRegexTest,
   assertSafeConditionGroup,
   findUnsafeConditionIssue,
+  isSafeFlagKey,
+  assertSafeFlagKey,
+  conditionReferencesSegment,
+  walkConditions,
+  validateOverridePath,
+  FORBIDDEN_KEYS,
 } from "./core/security";
+export { createLogger, noopLogger } from "./core/logger";
+export type { RolleaseLogger } from "./core/logger";
+export { INTERNAL_SECRET } from "./core/internal";
 
 // ── Database Adapters ──────────────────────────────────────────────────────
 export type { DbAdapter, CacheAdapter } from "./db/adapter";
@@ -159,6 +177,12 @@ export type {
 
 export interface RolleaseClient {
   flags: FlagManager;
+  /**
+   * @deprecated Read via `client[Symbol.for('rollease.internal.secret')]()` if
+   * absolutely necessary. This object remains present for one release to keep
+   * v1 middleware working, but it WILL leak the secret if the client is
+   * accidentally serialized.
+   */
   readonly __rollease?: {
     secret: string;
   };
@@ -205,6 +229,7 @@ export function createRollease(config: RolleaseConfig): RolleaseClient {
     (process.env.NODE_ENV === "development" || process.env.NODE_ENV === "dev");
 
   const useLocalOverrides = config.localOverrides ?? isDev;
+  const logger = createLogger(config.logging);
 
   const flags = new FlagManager({
     db: config.db,
@@ -213,13 +238,19 @@ export function createRollease(config: RolleaseConfig): RolleaseClient {
     l2TtlMs,
     useLocalOverrides,
     localOverridesFile: config.localOverridesFile,
+    hooks: config.hooks,
+    impressions: config.impressions,
+    logger,
+    evaluateAllPageSize: config.evaluateAllPageSize,
+    autoResolveSegments: config.autoResolveSegments,
   });
 
-  return {
+  // Capture the secret in a closure so it never appears on the public client
+  // object (would leak via JSON.stringify, Object.keys, structured cloning).
+  const secret = config.secret;
+
+  const client: RolleaseClient = {
     flags,
-    __rollease: {
-      secret: config.secret,
-    },
     async close() {
       if (config.db.close) {
         await config.db.close();
@@ -229,4 +260,14 @@ export function createRollease(config: RolleaseConfig): RolleaseClient {
       }
     },
   };
+
+  // Symbol-keyed slot. Invisible to property enumeration; ignored by JSON.
+  Object.defineProperty(client, INTERNAL_SECRET, {
+    value: () => secret,
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+
+  return client;
 }

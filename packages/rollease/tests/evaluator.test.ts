@@ -266,7 +266,7 @@ describe("Flag Evaluation Engine", () => {
         { op: "regex", actual: "hello", expected: "[invalid regex", result: false },
         { op: "exists", actual: "val", expected: true, result: true },
         { op: "exists", actual: undefined, expected: true, result: false },
-        { op: "exists", actual: undefined, expected: false, result: false },
+        { op: "exists", actual: undefined, expected: false, result: true },
         { op: "exists", actual: "val", expected: false, result: false },
         { op: "dateAfter", actual: "2026-05-27", expected: "2026-05-26", result: true },
         { op: "dateAfter", actual: "invalid-date", expected: "2026-05-26", result: false },
@@ -298,8 +298,8 @@ describe("Flag Evaluation Engine", () => {
       const cases = [
         { op: "semverGte", actual: "v2.3.0-beta", expected: "2.2.0", result: true },
         { op: "semverGte", actual: "1.0", expected: "1.0.0", result: true }, // padded
-        { op: "semverGte", actual: "invalid-semver", expected: "1.0.0", result: true },
-        { op: "semverGte", actual: "2.0.0", expected: "invalid-semver", result: true },
+        { op: "semverGte", actual: "invalid-semver", expected: "1.0.0", result: false },
+        { op: "semverGte", actual: "2.0.0", expected: "invalid-semver", result: false },
         { op: "semverLte", actual: "1.5.0", expected: "2.0.0", result: true },
       ];
 
@@ -400,6 +400,65 @@ describe("Flag Evaluation Engine", () => {
       const res = evaluateFlag(flag, { userId: "user-abc" });
       expect(["A", "B"]).toContain(res.value);
       expect(res.reason).toBe("weighted_random");
+    });
+  });
+
+  describe("variantId safety", () => {
+    it("warns and returns defaultValue when rule references a missing variantId", () => {
+      const flag: Flag = {
+        ...baseFlag,
+        type: "multivariate",
+        defaultValue: "safe-default",
+        variants: [{ id: "v1", key: "treatment", value: "T1", weight: 100 }],
+      };
+      const rule: FlagRule = {
+        id: "rule-1",
+        flagKey: flag.key,
+        priority: 1,
+        value: "rule-value-should-not-be-used",
+        enabled: true,
+        conditions: { any: [{ dimension: "userId", op: "eq", value: "alice" }] },
+        variantId: "v-deleted",
+      };
+
+      const warnings: string[] = [];
+      const res = evaluateFlag(
+        flag,
+        { userId: "alice" },
+        { rules: [rule], onWarning: (msg) => warnings.push(msg) }
+      );
+
+      expect(res.value).toBe("safe-default");
+      expect(res.reason).toBe("rule_match");
+      expect(res.ruleId).toBe("rule-1");
+      expect(warnings.length).toBe(1);
+      expect(warnings[0]).toMatch(/missing variantId/i);
+    });
+  });
+
+  describe("multivariate single-path consolidation", () => {
+    it("uses rollout.hashKey when set for variant distribution", () => {
+      const flag: Flag = {
+        ...baseFlag,
+        type: "multivariate",
+        variants: [
+          { id: "v1", key: "control", value: "A", weight: 50 },
+          { id: "v2", key: "treatment", value: "B", weight: 50 },
+        ],
+        rollout: {
+          percentage: 100,
+          sticky: true,
+          hashKey: "tenantId",
+        },
+      };
+
+      // Different userIds with the same tenantId must land in the same bucket
+      // because hashKey is tenantId, not userId.
+      const r1 = evaluateFlag(flag, { userId: "u-1", tenantId: "acme" });
+      const r2 = evaluateFlag(flag, { userId: "u-2", tenantId: "acme" });
+      expect(r1.value).toBe(r2.value);
+      expect(r1.variant).toBe(r2.variant);
+      expect(r1.reason).toBe("weighted_random");
     });
   });
 });

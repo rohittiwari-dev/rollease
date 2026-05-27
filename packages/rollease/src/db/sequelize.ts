@@ -15,6 +15,7 @@ import type {
   ListFlagsInput,
   ListFlagsResult,
   Release,
+  ReleaseSnapshot,
   Segment,
   SegmentUsage,
   UpdateFlagInput,
@@ -29,7 +30,10 @@ import {
   SegmentNotFoundError,
   ValidationError,
 } from "../core/errors";
-import { assertSafeConditionGroup } from "../core/security";
+import {
+  assertSafeConditionGroup,
+  conditionReferencesSegment,
+} from "../core/security";
 
 type ModelLike = {
   rawAttributes?: Record<string, unknown>;
@@ -92,10 +96,7 @@ export interface SequelizeAdapterOptions {
   sync?: boolean | Record<string, unknown>;
 }
 
-let counter = 0;
-function genId(prefix: string): string {
-  return `${prefix}_${++counter}_${Date.now().toString(36)}`;
-}
+
 
 export const ROLLEASE_SEQUELIZE_REQUIRED_COLUMNS: Record<
   SequelizeAdapterModelName,
@@ -140,6 +141,7 @@ export const ROLLEASE_SEQUELIZE_REQUIRED_COLUMNS: Record<
     "environment",
     "status",
     "changes",
+    "snapshots",
     "scheduledAt",
     "deployedAt",
     "deployedBy",
@@ -163,6 +165,7 @@ export class SequelizeDbAdapter implements DbAdapter {
   private syncOptions: boolean | Record<string, unknown>;
   private models?: Models;
   private initPromise?: Promise<void>;
+  private idCounter = 0;
 
   constructor(options: SequelizeAdapterOptions) {
     this.sequelize = options.sequelize;
@@ -172,6 +175,10 @@ export class SequelizeDbAdapter implements DbAdapter {
     this.tablePrefix = options.tablePrefix ?? "rollease_";
     this.modelNamePrefix = options.modelNamePrefix ?? "Rollease";
     this.syncOptions = options.sync ?? false;
+  }
+
+  private genId(prefix: string): string {
+    return `${prefix}_${++this.idCounter}_${Date.now().toString(36)}`;
   }
 
   async sync(options?: Record<string, unknown>): Promise<void> {
@@ -189,7 +196,7 @@ export class SequelizeDbAdapter implements DbAdapter {
 
     const now = new Date();
     const row = await models.Flag.create({
-      id: genId("flag"),
+      id: this.genId("flag"),
       key: input.key,
       type: input.type,
       status: "active",
@@ -202,7 +209,7 @@ export class SequelizeDbAdapter implements DbAdapter {
       environments: input.environments,
       variants: input.variants?.map((variant) => ({
         ...variant,
-        id: genId("var"),
+        id: this.genId("var"),
       })),
       rollout: input.rollout,
       scheduledAt: input.scheduledAt ? new Date(input.scheduledAt) : null,
@@ -408,7 +415,7 @@ export class SequelizeDbAdapter implements DbAdapter {
     assertSafeConditionGroup(input.conditions, "rule.conditions");
 
     const row = await models.Rule.create({
-      id: genId("rule"),
+      id: this.genId("rule"),
       flagKey,
       name: input.name,
       priority: input.priority,
@@ -550,7 +557,7 @@ export class SequelizeDbAdapter implements DbAdapter {
     const rows = await models.Rule.findAll();
     for (const row of rows) {
       const rule = this.toRule(row);
-      if (JSON.stringify(rule.conditions).includes(key)) {
+      if (conditionReferencesSegment(rule.conditions, key)) {
         usage.push({ flagKey: rule.flagKey, ruleId: rule.id });
       }
     }
@@ -562,12 +569,13 @@ export class SequelizeDbAdapter implements DbAdapter {
     const now = new Date();
     return this.toRelease(
       await models.Release.create({
-        id: genId("rel"),
+        id: this.genId("rel"),
         name: input.name,
         description: input.description,
         environment: input.environment,
         status: input.scheduledAt ? "scheduled" : "pending",
         changes: input.changes,
+        snapshots: [],
         scheduledAt: input.scheduledAt || null,
         deployedAt: null,
         deployedBy: undefined,
@@ -607,10 +615,24 @@ export class SequelizeDbAdapter implements DbAdapter {
   async deployRelease(releaseId: string, deployedBy?: string): Promise<void> {
     const release = await this.getRequiredRelease(releaseId);
     const models = await this.getModels();
+    const snapshots: ReleaseSnapshot[] = [];
+    const snapshotted = new Set<string>();
 
     for (const change of release.changes) {
       const flag = await this.getFlag(change.flagKey);
       if (!flag) continue;
+
+      if (!snapshotted.has(change.flagKey)) {
+        snapshotted.add(change.flagKey);
+        snapshots.push({
+          flagKey: change.flagKey,
+          beforeValue: flag.defaultValue,
+          beforeStatus: flag.status,
+          beforeRollout: flag.rollout
+            ? { ...flag.rollout, rampSchedule: flag.rollout.rampSchedule?.slice() }
+            : undefined,
+        });
+      }
 
       const patch: Record<string, unknown> = { updatedAt: new Date() };
       switch (change.action) {
@@ -645,7 +667,12 @@ export class SequelizeDbAdapter implements DbAdapter {
     }
 
     await models.Release.update(
-      { status: "deployed", deployedAt: new Date(), deployedBy },
+      {
+        status: "deployed",
+        deployedAt: new Date(),
+        deployedBy,
+        snapshots,
+      },
       { where: { id: releaseId } }
     );
     await this.addHistory({
@@ -664,26 +691,41 @@ export class SequelizeDbAdapter implements DbAdapter {
     const release = await this.getRequiredRelease(releaseId);
     const models = await this.getModels();
 
-    for (const change of release.changes) {
-      const flag = await this.getFlag(change.flagKey);
-      if (!flag) continue;
-
-      const patch: Record<string, unknown> = { updatedAt: new Date() };
-      switch (change.action) {
-        case "enable":
-          patch.defaultValue = false;
-          break;
-        case "disable":
-          patch.defaultValue = true;
-          break;
-        case "kill":
-          patch.status = "active";
-          break;
-        case "restore":
-          patch.status = "killed";
-          break;
+    if (release.snapshots && release.snapshots.length > 0) {
+      for (const snap of release.snapshots) {
+        const flag = await this.getFlag(snap.flagKey);
+        if (!flag) continue;
+        await models.Flag.update(
+          {
+            defaultValue: snap.beforeValue,
+            status: snap.beforeStatus,
+            rollout: snap.beforeRollout ?? null,
+            updatedAt: new Date(),
+          },
+          { where: { key: snap.flagKey } }
+        );
       }
-      await models.Flag.update(patch, { where: { key: change.flagKey } });
+    } else {
+      for (const change of release.changes) {
+        const flag = await this.getFlag(change.flagKey);
+        if (!flag) continue;
+        const patch: Record<string, unknown> = { updatedAt: new Date() };
+        switch (change.action) {
+          case "enable":
+            patch.defaultValue = false;
+            break;
+          case "disable":
+            patch.defaultValue = true;
+            break;
+          case "kill":
+            patch.status = "active";
+            break;
+          case "restore":
+            patch.status = "killed";
+            break;
+        }
+        await models.Flag.update(patch, { where: { key: change.flagKey } });
+      }
     }
 
     await models.Release.update(
@@ -710,6 +752,25 @@ export class SequelizeDbAdapter implements DbAdapter {
     return row ? String(plain(row).variantKey) : null;
   }
 
+  async getUserAssignments(
+    flagKeys: string[],
+    userId: string
+  ): Promise<Record<string, string>> {
+    if (flagKeys.length === 0) return {};
+    const models = await this.getModels();
+    const rows = await models.Assignment.findAll({ where: { userId } });
+    const out: Record<string, string> = {};
+    const wanted = new Set(flagKeys);
+    for (const row of rows) {
+      const data = plain(row);
+      const key = String(data.flagKey);
+      if (wanted.has(key)) {
+        out[key] = String(data.variantKey);
+      }
+    }
+    return out;
+  }
+
   async setUserAssignment(
     flagKey: string,
     userId: string,
@@ -726,7 +787,7 @@ export class SequelizeDbAdapter implements DbAdapter {
 
   async addHistory(entry: Omit<HistoryEntry, "id">): Promise<void> {
     const models = await this.getModels();
-    await models.History.create({ ...entry, id: genId("hist") });
+    await models.History.create({ ...entry, id: this.genId("hist") });
   }
 
   async getHistory(
@@ -748,13 +809,15 @@ export class SequelizeDbAdapter implements DbAdapter {
     reason: string;
   }): Promise<void> {
     const models = await this.getModels();
-    await models.Impression.create({ ...params, id: genId("imp"), at: new Date() });
+    await models.Impression.create({ ...params, id: this.genId("imp"), at: new Date() });
   }
 
   async getAllActiveFlags(opts?: {
     namespace?: string;
     tags?: string[];
     keys?: string[];
+    limit?: number;
+    offset?: number;
   }): Promise<Flag[]> {
     const list = await this.listFlags({ status: "active" });
     let flags = list.data;
@@ -772,6 +835,12 @@ export class SequelizeDbAdapter implements DbAdapter {
     }
     if (opts?.keys?.length) {
       flags = flags.filter((flag) => opts.keys!.includes(flag.key));
+    }
+    const offset = opts?.offset ?? 0;
+    if (opts?.limit !== undefined) {
+      flags = flags.slice(offset, offset + opts.limit);
+    } else if (offset > 0) {
+      flags = flags.slice(offset);
     }
     return flags;
   }
@@ -891,6 +960,7 @@ export class SequelizeDbAdapter implements DbAdapter {
           environment: field(DataTypes, "STRING"),
           status: field(DataTypes, "STRING", { allowNull: false }),
           changes: field(DataTypes, "JSON", { allowNull: false }),
+          snapshots: field(DataTypes, "JSON"),
           scheduledAt: field(DataTypes, "DATE"),
           deployedAt: field(DataTypes, "DATE"),
           deployedBy: field(DataTypes, "STRING"),
@@ -1021,6 +1091,7 @@ export class SequelizeDbAdapter implements DbAdapter {
       environment: optionalString(data.environment),
       status: data.status as Release["status"],
       changes: data.changes as Release["changes"],
+      snapshots: arrayOrUndefined<ReleaseSnapshot>(data.snapshots),
       scheduledAt: data.scheduledAt ? new Date(data.scheduledAt).toISOString() : null,
       deployedAt: nullableDate(data.deployedAt),
       deployedBy: optionalString(data.deployedBy),

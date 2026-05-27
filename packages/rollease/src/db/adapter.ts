@@ -14,6 +14,7 @@ import type {
   ListFlagsResult,
   AddRuleInput,
   UpdateRuleInput,
+  RuleOrdering,
   CreateSegmentInput,
   UpdateSegmentInput,
   CreateReleaseInput,
@@ -79,7 +80,7 @@ export interface DbAdapter {
   listRules(flagKey: string): Promise<FlagRule[]>;
 
   /** Reorder rules by setting new priorities. */
-  reorderRules(flagKey: string, ordering: { ruleId: string; priority: number }[]): Promise<void>;
+  reorderRules(flagKey: string, ordering: RuleOrdering[]): Promise<void>;
 
   // ── Segments ─────────────────────────────────────────────────────────
 
@@ -127,6 +128,16 @@ export interface DbAdapter {
   /** Get a user's sticky variant assignment for a flag. */
   getUserAssignment(flagKey: string, userId: string): Promise<string | null>;
 
+  /**
+   * Batched variant: return assignments for many flags in one round-trip.
+   * Optional — when omitted, FlagManager.evaluateAll falls back to N calls.
+   * Implement in production adapters to avoid N+1 queries on bulk evaluate.
+   */
+  getUserAssignments?(
+    flagKeys: string[],
+    userId: string
+  ): Promise<Record<string, string>>;
+
   /** Set a user's sticky variant assignment. */
   setUserAssignment(flagKey: string, userId: string, variantKey: string): Promise<void>;
 
@@ -151,11 +162,16 @@ export interface DbAdapter {
 
   // ── Bulk Operations ──────────────────────────────────────────────────
 
-  /** Get all active flags for bulk evaluation. */
+  /**
+   * Get all active flags for bulk evaluation. Supports pagination so very
+   * large flag tables don't have to be loaded into memory at once.
+   */
   getAllActiveFlags(opts?: {
     namespace?: string;
     tags?: string[];
     keys?: string[];
+    limit?: number;
+    offset?: number;
   }): Promise<Flag[]>;
 
   // ── Tags ─────────────────────────────────────────────────────────────

@@ -24,6 +24,79 @@ export interface RolleaseConfig {
   localOverrides?: boolean;
   /** Override file path (default: '.rolleaserc.json') */
   localOverridesFile?: string;
+  /** Per-evaluation impression tracking */
+  impressions?: ImpressionConfig;
+  /** Lifecycle hooks for extension (RBAC/ABAC, custom audit, metrics) */
+  hooks?: RolleaseHooks;
+  /** Logging configuration (level + sink). When unset, falls back to console. */
+  logging?: LoggingConfig;
+  /** Page size used by evaluateAll/getAllActiveFlags (default 1000). */
+  evaluateAllPageSize?: number;
+  /**
+   * When enabled, the SDK automatically evaluates segment definitions from
+   * the database against the user context to populate `context.segments`.
+   * Skipped when the caller pre-populates `context.segments`.
+   * Default: false (opt-in for backward compatibility).
+   */
+  autoResolveSegments?: boolean;
+}
+
+export interface ImpressionConfig {
+  /** Disable impression tracking entirely (default: enabled when db.trackImpression exists) */
+  enabled?: boolean;
+  /** Sample rate 0..1 (default 1.0). 0 disables, 1 tracks every evaluation. */
+  sampleRate?: number;
+}
+
+export interface RolleaseHooks {
+  /**
+   * Called before any write operation. Throwing aborts the operation (use for RBAC denials).
+   * `flagKey` is undefined for global operations like killAll.
+   */
+  onBeforeMutation?: (ctx: {
+    action: HistoryAction;
+    flagKey?: string;
+    actor?: AuditActor;
+  }) => Promise<void> | void;
+  /**
+   * Called before a single flag evaluation. Throwing aborts evaluation.
+   * Use to enforce tenant-isolation or permission checks at read time.
+   */
+  onBeforeEvaluation?: (ctx: {
+    flagKey: string;
+    context: FlagContext;
+  }) => Promise<void> | void;
+  /**
+   * Called after every evaluation (single or bulk). Fire-and-forget — errors are logged.
+   */
+  onEvaluate?: (
+    result: FlagResult,
+    context: FlagContext
+  ) => Promise<void> | void;
+}
+
+export type LogLevel = "silent" | "error" | "warn" | "info" | "debug";
+
+export interface LoggingConfig {
+  /** Threshold below which messages are dropped. Default 'warn'. */
+  level?: LogLevel;
+  /** Custom sink. Default writes to console.<level>. */
+  sink?: (
+    level: Exclude<LogLevel, "silent">,
+    message: string,
+    meta?: Record<string, unknown>
+  ) => void;
+}
+
+/**
+ * Identifies the actor performing a write operation. Used in audit history
+ * and surfaced to permission hooks.
+ */
+export interface AuditActor {
+  id: string;
+  type: "user" | "service" | "system";
+  name?: string;
+  metadata?: Record<string, unknown>;
 }
 
 export interface CacheConfig {
@@ -263,6 +336,11 @@ export interface Release {
   environment?: string;
   status: ReleaseStatus;
   changes: ReleaseChange[];
+  /**
+   * Before-snapshots captured at deploy time so rollback can restore exact prior state.
+   * Populated by deployRelease(); absent on releases created before snapshots were added.
+   */
+  snapshots?: ReleaseSnapshot[];
   scheduledAt?: string | null;
   deployedAt?: Date | null;
   deployedBy?: string;
@@ -270,6 +348,17 @@ export interface Release {
   rolledBackBy?: string;
   rollbackReason?: string;
   createdAt: Date;
+}
+
+/**
+ * Per-flag state captured before a release change is applied.
+ * Used by rollbackRelease() to restore the exact prior value/status/rollout.
+ */
+export interface ReleaseSnapshot {
+  flagKey: string;
+  beforeValue: unknown;
+  beforeStatus: FlagStatus;
+  beforeRollout?: RolloutConfig;
 }
 
 export type ReleaseAction =
@@ -303,6 +392,9 @@ export type HistoryAction =
   | "flag.restored"
   | "flag.killed"
   | "flag.deleted"
+  | "flag.locked"
+  | "flag.unlocked"
+  | "flag.cloned"
   | "rule.added"
   | "rule.updated"
   | "rule.removed"
@@ -321,7 +413,11 @@ export interface HistoryEntry {
   id: string;
   flagKey?: string;
   action: HistoryAction;
-  by?: string;
+  /**
+   * Actor who performed the action. String form is preserved for backwards
+   * compatibility (older audit logs); new code should pass an AuditActor.
+   */
+  by?: string | AuditActor;
   at: Date;
   changes?: Record<string, unknown>;
   reason?: string;
@@ -369,17 +465,30 @@ export interface CreateFlagInput {
   rollout?: RolloutConfig;
   scheduledAt?: string | null;
   expiresAt?: string | null;
+  actor?: AuditActor;
 }
 
 export interface UpdateFlagInput {
   defaultValue?: unknown;
   description?: string;
   tags?: string[];
+  /**
+   * @deprecated Use `setLock(key, { locked, reason, actor })` instead. Passing
+   * `locked` on a currently-locked flag is rejected — see FlagLockedError.
+   */
   locked?: boolean;
+  /** @deprecated Use setLock(). */
   lockedReason?: string;
   environments?: string[];
   scheduledAt?: string | null;
   expiresAt?: string | null;
+  actor?: AuditActor;
+}
+
+export interface SetLockInput {
+  locked: boolean;
+  reason?: string;
+  actor?: AuditActor;
 }
 
 export interface ListFlagsInput {
@@ -407,6 +516,7 @@ export interface AddRuleInput {
   rolloutPct?: number;
   isHoldout?: boolean;
   variantId?: string;
+  actor?: AuditActor;
 }
 
 export interface UpdateRuleInput {
@@ -418,6 +528,7 @@ export interface UpdateRuleInput {
   rolloutPct?: number;
   isHoldout?: boolean;
   variantId?: string;
+  actor?: AuditActor;
 }
 
 export interface RuleOrdering {
@@ -429,11 +540,13 @@ export interface CreateSegmentInput {
   key: string;
   description?: string;
   rules: FlagConditionGroup;
+  actor?: AuditActor;
 }
 
 export interface UpdateSegmentInput {
   description?: string;
   rules?: FlagConditionGroup;
+  actor?: AuditActor;
 }
 
 export interface CreateReleaseInput {
@@ -442,34 +555,41 @@ export interface CreateReleaseInput {
   environment?: string;
   changes: ReleaseChange[];
   scheduledAt?: string | null;
+  actor?: AuditActor;
 }
 
 export interface KillFlagInput {
   reason?: string;
   killedBy?: string;
+  actor?: AuditActor;
 }
 
 export interface RestoreFlagInput {
   restoredBy?: string;
   reason?: string;
+  actor?: AuditActor;
 }
 
 export interface ArchiveFlagInput {
   reason?: string;
   archivedBy?: string;
+  actor?: AuditActor;
 }
 
 export interface DeployReleaseInput {
   deployedBy?: string;
+  actor?: AuditActor;
 }
 
 export interface RollbackReleaseInput {
   rolledBackBy?: string;
   reason?: string;
+  actor?: AuditActor;
 }
 
 export interface CloneFlagInput {
   newKey: string;
   includeRules?: boolean;
   includeRollout?: boolean;
+  actor?: AuditActor;
 }

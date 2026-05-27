@@ -4,17 +4,15 @@
 // Implements the 9-step evaluation pipeline.
 // ============================================================================
 
-import { getBucket, murmurhash3_32 } from "../bucket";
+import { getBucket } from "../bucket";
 import { safeRegexTest } from "../core/security";
 import type {
   Flag,
   FlagRule,
   FlagContext,
   FlagResult,
-  Variant,
   FlagConditionGroup,
   FlagConditionLeaf,
-  FlagVariantDef,
   Segment,
   RolloutConfig,
   EvalReason,
@@ -29,18 +27,18 @@ function parseSemver(v: string): number[] {
   return parts;
 }
 
-function semverCompare(v1: string, v2: string): number {
+function semverCompare(v1: string, v2: string): number | null {
   try {
     const p1 = parseSemver(v1);
     const p2 = parseSemver(v2);
     for (let i = 0; i < 3; i++) {
-      if (Number.isNaN(p1[i]) || Number.isNaN(p2[i])) return 0;
+      if (Number.isNaN(p1[i]) || Number.isNaN(p2[i])) return null;
       if (p1[i] > p2[i]) return 1;
       if (p1[i] < p2[i]) return -1;
     }
     return 0;
   } catch {
-    return 0;
+    return null;
   }
 }
 
@@ -66,6 +64,10 @@ function resolveDimension(
       return context.version;
     case "segment":
       return context.segments;
+    case "ip":
+      return context.ip;
+    case "tenantId":
+      return context.tenantId;
     case "device":
       return context.attributes?.device;
     case "channel":
@@ -111,7 +113,7 @@ function evaluateConditionLeaf(
  */
 function evaluateOperator(op: string, actual: unknown, expected: unknown): boolean {
   if (actual === undefined || actual === null) {
-    if (op === "exists") return false;
+    if (op === "exists") return !expected;
     if (op === "neq" || op === "nin") return true;
     return false;
   }
@@ -130,6 +132,13 @@ function evaluateOperator(op: string, actual: unknown, expected: unknown): boole
           return actual.some((v) => expected.includes(v));
         }
         return expected.includes(actual);
+      }
+      // When expected is a string and actual is an array (e.g. segment matching)
+      if (Array.isArray(actual) && typeof expected === "string") {
+        return actual.includes(expected);
+      }
+      if (typeof expected === "string") {
+        return actual === expected;
       }
       return false;
 
@@ -166,36 +175,32 @@ function evaluateOperator(op: string, actual: unknown, expected: unknown): boole
     case "regex":
       return safeRegexTest(expected, actual);
 
-    case "semverGte":
-      return (
-        typeof actual === "string" &&
-        typeof expected === "string" &&
-        semverCompare(actual, expected) >= 0
-      );
+    case "semverGte": {
+      if (typeof actual !== "string" || typeof expected !== "string") return false;
+      const cmpGte = semverCompare(actual, expected);
+      return cmpGte !== null && cmpGte >= 0;
+    }
 
-    case "semverLte":
-      return (
-        typeof actual === "string" &&
-        typeof expected === "string" &&
-        semverCompare(actual, expected) <= 0
-      );
+    case "semverLte": {
+      if (typeof actual !== "string" || typeof expected !== "string") return false;
+      const cmpLte = semverCompare(actual, expected);
+      return cmpLte !== null && cmpLte <= 0;
+    }
 
     case "exists":
       return expected ? actual !== undefined && actual !== null : actual === undefined || actual === null;
 
-    case "dateAfter":
-      try {
-        return new Date(String(actual)).getTime() > new Date(String(expected)).getTime();
-      } catch {
-        return false;
-      }
+    case "dateAfter": {
+      const aAfter = new Date(String(actual)).getTime();
+      const bAfter = new Date(String(expected)).getTime();
+      return !isNaN(aAfter) && !isNaN(bAfter) && aAfter > bAfter;
+    }
 
-    case "dateBefore":
-      try {
-        return new Date(String(actual)).getTime() < new Date(String(expected)).getTime();
-      } catch {
-        return false;
-      }
+    case "dateBefore": {
+      const aBefore = new Date(String(actual)).getTime();
+      const bBefore = new Date(String(expected)).getTime();
+      return !isNaN(aBefore) && !isNaN(bBefore) && aBefore < bBefore;
+    }
 
     default:
       return false;
@@ -311,6 +316,12 @@ export interface EvaluateOptions {
   segments?: Segment[];
   /** Current date (for testing date-based logic) */
   now?: Date;
+  /**
+   * Optional logger callback for evaluator warnings (e.g. a rule pointing at
+   * a deleted variant). Keeps the evaluator pure — it never touches console
+   * directly so it stays safe in Edge runtimes and tests.
+   */
+  onWarning?: (message: string, meta?: Record<string, unknown>) => void;
 }
 
 /**
@@ -406,9 +417,16 @@ export function evaluateFlag<T = unknown>(
         if (variant) {
           return makeResult(flag, variant.value, variant.key, "rule_match", rule.id, now);
         }
+        // Warn loudly — rule points at a variant that was renamed or deleted.
+        // Falling through to rule.value would silently swap the user into the
+        // wrong cohort. Bail with default + diagnostic.
+        options.onWarning?.(
+          "Rule references missing variantId — falling back to default value",
+          { flagKey: flag.key, ruleId: rule.id, variantId: rule.variantId }
+        );
+        return makeResult(flag, flag.defaultValue, null, "rule_match", rule.id, now);
       }
 
-      // Return rule's value
       const ruleValue =
         flag.type === "boolean" ? (rule.value ?? true) : rule.value;
 
@@ -416,41 +434,33 @@ export function evaluateFlag<T = unknown>(
     }
   }
 
-  // ── Step 8: Percentage Rollout ───────────────────────────────────────
-  if (flag.rollout && context.userId) {
-    const effectivePct = resolveRolloutPercentage(flag.rollout, now);
-    const hashField = flag.rollout.hashKey || "userId";
-    const hashValue = (context as Record<string, unknown>)[hashField] as string || context.userId;
-    const bucket = getBucket(hashValue, flag.key);
+  // ── Step 8: Rollout / Multivariate Distribution ───────────────────────
+  // Single weighted-distribution path. For multivariate flags, weights drive
+  // the assignment. For boolean/string/number rollouts, the percentage gate
+  // decides on/off.
+  const hashField = flag.rollout?.hashKey || "userId";
+  const hashValue =
+    ((context as Record<string, unknown>)[hashField] as string | undefined) ??
+    context.userId;
 
-    if (flag.type === "multivariate" && flag.variants && flag.variants.length > 0) {
-      // Distribute among weighted variants
-      let cumWeight = 0;
+  if (flag.type === "multivariate" && flag.variants && flag.variants.length > 0) {
+    if (hashValue) {
+      const bucket = getBucket(hashValue, flag.key);
       const sorted = [...flag.variants].sort((a, b) => a.key.localeCompare(b.key));
-
+      let cumWeight = 0;
       for (const v of sorted) {
         cumWeight += v.weight;
         if (bucket < cumWeight) {
           return makeResult(flag, v.value, v.key, "weighted_random", null, now);
         }
       }
-    } else if (bucket < effectivePct) {
+    }
+  } else if (flag.rollout && hashValue) {
+    const effectivePct = resolveRolloutPercentage(flag.rollout, now);
+    const bucket = getBucket(hashValue, flag.key);
+    if (bucket < effectivePct) {
       const value = flag.type === "boolean" ? true : flag.defaultValue;
       return makeResult(flag, value, null, "percentage", null, now);
-    }
-  }
-
-  // For non-rollout multivariate flags with variants, use weighted distribution
-  if (flag.type === "multivariate" && flag.variants && flag.variants.length > 0 && context.userId) {
-    const bucket = getBucket(context.userId, flag.key);
-    let cumWeight = 0;
-    const sorted = [...flag.variants].sort((a, b) => a.key.localeCompare(b.key));
-
-    for (const v of sorted) {
-      cumWeight += v.weight;
-      if (bucket < cumWeight) {
-        return makeResult(flag, v.value, v.key, "weighted_random", null, now);
-      }
     }
   }
 

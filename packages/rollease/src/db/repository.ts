@@ -16,6 +16,8 @@ import type {
   ListFlagsInput,
   ListFlagsResult,
   Release,
+  ReleaseSnapshot,
+  RuleOrdering,
   Segment,
   SegmentUsage,
   UpdateFlagInput,
@@ -30,7 +32,10 @@ import {
   SegmentNotFoundError,
   ValidationError,
 } from "../core/errors";
-import { assertSafeConditionGroup } from "../core/security";
+import {
+  assertSafeConditionGroup,
+  conditionReferencesSegment,
+} from "../core/security";
 
 export type RepositoryName =
   | "Flag"
@@ -113,6 +118,7 @@ export const ROLLEASE_REPOSITORY_REQUIRED_COLUMNS: Record<
     "environment",
     "status",
     "changes",
+    "snapshots",
     "scheduledAt",
     "deployedAt",
     "deployedBy",
@@ -126,14 +132,11 @@ export const ROLLEASE_REPOSITORY_REQUIRED_COLUMNS: Record<
   Impression: ["id", "flagKey", "userId", "value", "variant", "reason", "at"],
 };
 
-let counter = 0;
-function genId(prefix: string): string {
-  return `${prefix}_${++counter}_${Date.now().toString(36)}`;
-}
 
 export class RepositoryDbAdapter implements DbAdapter {
   protected repositories: RepositorySet;
   private closeHandler?: () => Promise<void>;
+  private idCounter = 0;
 
   constructor(
     repositories: RepositorySet,
@@ -144,6 +147,10 @@ export class RepositoryDbAdapter implements DbAdapter {
     this.closeHandler = opts.close;
   }
 
+  private genId(prefix: string): string {
+    return `${prefix}_${++this.idCounter}_${Date.now().toString(36)}`;
+  }
+
   async createFlag(input: CreateFlagInput): Promise<Flag> {
     if (await this.getFlag(input.key)) {
       throw new FlagConflictError(input.key, "flag");
@@ -151,7 +158,7 @@ export class RepositoryDbAdapter implements DbAdapter {
 
     const now = new Date();
     const row = await this.repositories.Flag.create({
-      id: genId("flag"),
+      id: this.genId("flag"),
       key: input.key,
       type: input.type,
       status: "active",
@@ -164,7 +171,7 @@ export class RepositoryDbAdapter implements DbAdapter {
       environments: input.environments,
       variants: input.variants?.map((variant) => ({
         ...variant,
-        id: genId("var"),
+        id: this.genId("var"),
       })),
       rollout: input.rollout,
       scheduledAt: input.scheduledAt ? new Date(input.scheduledAt) : null,
@@ -366,7 +373,7 @@ export class RepositoryDbAdapter implements DbAdapter {
     assertSafeConditionGroup(input.conditions, "rule.conditions");
 
     const row = await this.repositories.Rule.create({
-      id: genId("rule"),
+      id: this.genId("rule"),
       flagKey,
       name: input.name,
       priority: input.priority,
@@ -437,7 +444,7 @@ export class RepositoryDbAdapter implements DbAdapter {
 
   async reorderRules(
     flagKey: string,
-    ordering: { ruleId: string; priority: number }[]
+    ordering: RuleOrdering[]
   ): Promise<void> {
     for (const item of ordering) {
       await this.repositories.Rule.update(
@@ -501,7 +508,7 @@ export class RepositoryDbAdapter implements DbAdapter {
     const rows = await this.repositories.Rule.findMany();
     for (const row of rows) {
       const rule = toRule(row);
-      if (JSON.stringify(rule.conditions).includes(key)) {
+      if (conditionReferencesSegment(rule.conditions, key)) {
         usage.push({ flagKey: rule.flagKey, ruleId: rule.id });
       }
     }
@@ -512,12 +519,13 @@ export class RepositoryDbAdapter implements DbAdapter {
     const now = new Date();
     return toRelease(
       await this.repositories.Release.create({
-        id: genId("rel"),
+        id: this.genId("rel"),
         name: input.name,
         description: input.description,
         environment: input.environment,
         status: input.scheduledAt ? "scheduled" : "pending",
         changes: input.changes,
+        snapshots: [],
         scheduledAt: input.scheduledAt || null,
         deployedAt: null,
         deployedBy: undefined,
@@ -552,10 +560,28 @@ export class RepositoryDbAdapter implements DbAdapter {
 
   async deployRelease(releaseId: string, deployedBy?: string): Promise<void> {
     const release = await this.getRequiredRelease(releaseId);
+    const snapshots: ReleaseSnapshot[] = [];
+    const snapshotted = new Set<string>();
 
     for (const change of release.changes) {
       const flag = await this.getFlag(change.flagKey);
       if (!flag) continue;
+
+      // Capture before-state for exact rollback restoration.
+      // Only snapshot the first time we encounter this flag — subsequent
+      // changes to the same flag within this release should not overwrite
+      // the original pre-deployment state.
+      if (!snapshotted.has(change.flagKey)) {
+        snapshotted.add(change.flagKey);
+        snapshots.push({
+          flagKey: change.flagKey,
+          beforeValue: flag.defaultValue,
+          beforeStatus: flag.status,
+          beforeRollout: flag.rollout
+            ? { ...flag.rollout, rampSchedule: flag.rollout.rampSchedule?.slice() }
+            : undefined,
+        });
+      }
 
       const patch: Record<string, unknown> = { updatedAt: new Date() };
       switch (change.action) {
@@ -591,7 +617,12 @@ export class RepositoryDbAdapter implements DbAdapter {
 
     await this.repositories.Release.update(
       { id: releaseId },
-      { status: "deployed", deployedAt: new Date(), deployedBy }
+      {
+        status: "deployed",
+        deployedAt: new Date(),
+        deployedBy,
+        snapshots,
+      }
     );
     await this.addHistory({
       action: "release.deployed",
@@ -608,26 +639,43 @@ export class RepositoryDbAdapter implements DbAdapter {
   ): Promise<void> {
     const release = await this.getRequiredRelease(releaseId);
 
-    for (const change of release.changes) {
-      const flag = await this.getFlag(change.flagKey);
-      if (!flag) continue;
-
-      const patch: Record<string, unknown> = { updatedAt: new Date() };
-      switch (change.action) {
-        case "enable":
-          patch.defaultValue = false;
-          break;
-        case "disable":
-          patch.defaultValue = true;
-          break;
-        case "kill":
-          patch.status = "active";
-          break;
-        case "restore":
-          patch.status = "killed";
-          break;
+    if (release.snapshots && release.snapshots.length > 0) {
+      for (const snap of release.snapshots) {
+        const flag = await this.getFlag(snap.flagKey);
+        if (!flag) continue;
+        await this.repositories.Flag.update(
+          { key: snap.flagKey },
+          {
+            defaultValue: snap.beforeValue,
+            status: snap.beforeStatus,
+            rollout: snap.beforeRollout ?? null,
+            updatedAt: new Date(),
+          }
+        );
       }
-      await this.repositories.Flag.update({ key: change.flagKey }, patch);
+    } else {
+      // Legacy fallback for releases deployed before snapshots existed.
+      for (const change of release.changes) {
+        const flag = await this.getFlag(change.flagKey);
+        if (!flag) continue;
+
+        const patch: Record<string, unknown> = { updatedAt: new Date() };
+        switch (change.action) {
+          case "enable":
+            patch.defaultValue = false;
+            break;
+          case "disable":
+            patch.defaultValue = true;
+            break;
+          case "kill":
+            patch.status = "active";
+            break;
+          case "restore":
+            patch.status = "killed";
+            break;
+        }
+        await this.repositories.Flag.update({ key: change.flagKey }, patch);
+      }
     }
 
     await this.repositories.Release.update(
@@ -653,6 +701,30 @@ export class RepositoryDbAdapter implements DbAdapter {
     return row ? String(plain(row).variantKey) : null;
   }
 
+  async getUserAssignments(
+    flagKeys: string[],
+    userId: string
+  ): Promise<Record<string, string>> {
+    if (flagKeys.length === 0) return {};
+    // Most repositories accept simple `{ field: value }` where-clauses; for
+    // a multi-key match we fan out one findOne per key but keep this single
+    // method so callers benefit from the batched signature today and from a
+    // future `findMany({ where: { userId, flagKey: { in: [...] } } })` later.
+    const out: Record<string, string> = {};
+    const rows = await this.repositories.Assignment.findMany({
+      where: { userId },
+    });
+    const wanted = new Set(flagKeys);
+    for (const row of rows) {
+      const data = plain(row);
+      const key = String(data.flagKey);
+      if (wanted.has(key)) {
+        out[key] = String(data.variantKey);
+      }
+    }
+    return out;
+  }
+
   async setUserAssignment(
     flagKey: string,
     userId: string,
@@ -667,7 +739,7 @@ export class RepositoryDbAdapter implements DbAdapter {
   }
 
   async addHistory(entry: Omit<HistoryEntry, "id">): Promise<void> {
-    await this.repositories.History.create({ ...entry, id: genId("hist") });
+    await this.repositories.History.create({ ...entry, id: this.genId("hist") });
   }
 
   async getHistory(
@@ -694,7 +766,7 @@ export class RepositoryDbAdapter implements DbAdapter {
   }): Promise<void> {
     await this.repositories.Impression.create({
       ...params,
-      id: genId("imp"),
+      id: this.genId("imp"),
       at: new Date(),
     });
   }
@@ -703,7 +775,12 @@ export class RepositoryDbAdapter implements DbAdapter {
     namespace?: string;
     tags?: string[];
     keys?: string[];
+    limit?: number;
+    offset?: number;
   }): Promise<Flag[]> {
+    // Fetch ALL active flags first, then apply filters, then paginate.
+    // This ensures namespace/tags/keys filters don't miss results that
+    // happen to fall outside the first page boundary.
     const list = await this.listFlags({ status: "active" });
     let flags = list.data;
     if (opts?.namespace) {
@@ -720,6 +797,13 @@ export class RepositoryDbAdapter implements DbAdapter {
     }
     if (opts?.keys?.length) {
       flags = flags.filter((flag) => opts.keys!.includes(flag.key));
+    }
+    // Apply pagination AFTER filtering
+    const offset = opts?.offset ?? 0;
+    if (opts?.limit !== undefined) {
+      flags = flags.slice(offset, offset + opts.limit);
+    } else if (offset > 0) {
+      flags = flags.slice(offset);
     }
     return flags;
   }
@@ -832,6 +916,7 @@ export function toRelease(row: unknown): Release {
     environment: optionalString(data.environment),
     status: data.status as Release["status"],
     changes: data.changes as Release["changes"],
+    snapshots: arrayOrUndefined<ReleaseSnapshot>(data.snapshots),
     scheduledAt: data.scheduledAt ? new Date(data.scheduledAt).toISOString() : null,
     deployedAt: nullableDate(data.deployedAt),
     deployedBy: optionalString(data.deployedBy),

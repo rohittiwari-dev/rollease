@@ -97,6 +97,16 @@
       "import": "./dist/core/security.mjs",
       "require": "./dist/core/security.js"
     },
+    "./core/logger": {
+      "types": "./dist/core/logger.d.ts",
+      "import": "./dist/core/logger.mjs",
+      "require": "./dist/core/logger.js"
+    },
+    "./core/internal": {
+      "types": "./dist/core/internal.d.ts",
+      "import": "./dist/core/internal.mjs",
+      "require": "./dist/core/internal.js"
+    },
     "./engine/evaluator": {
       "types": "./dist/engine/evaluator.d.ts",
       "import": "./dist/engine/evaluator.mjs",
@@ -121,7 +131,9 @@
     "@prisma/client": "^5.0.0 || ^6.0.0",
     "drizzle-orm": "^0.36.0",
     "next": "",
+    "pg": "^8.13.1",
     "react": "^19.2.6",
+    "redis": "^4.7.0",
     "sequelize": "^6.37.0"
   },
   "peerDependenciesMeta": {
@@ -134,18 +146,21 @@
     "next": {
       "optional": true
     },
+    "pg": {
+      "optional": true
+    },
     "react": {
+      "optional": true
+    },
+    "redis": {
       "optional": true
     },
     "sequelize": {
       "optional": true
     }
   },
-  "dependencies": {
-    "pg": "^8.13.1",
-    "redis": "^4.7.0"
-  },
   "devDependencies": {
+    "@edge-runtime/vm": "^4.0.0",
     "@testing-library/react": "^16.3.2",
     "@types/node": "^20.11.0",
     "@types/pg": "^8.11.10",
@@ -153,7 +168,9 @@
     "@vitest/coverage-v8": "^4.1.7",
     "happy-dom": "^20.9.0",
     "next": "^15.0.0",
+    "pg": "^8.13.1",
     "react-dom": "^19.2.6",
+    "redis": "^4.7.0",
     "tsup": "^8.3.5",
     "typescript": "5.9.2",
     "vitest": "^4.1.7"
