@@ -44,6 +44,19 @@ export type {
   FlagPrerequisite,
   EvalReason,
 
+  // Typed flag keys
+  FlagDefinitions,
+  TypedFlagKey,
+  HasFlagDefinitions,
+  FlagTypeToTS,
+  FlagValueType,
+  FlagDefaultValue,
+  BooleanFlagKey,
+  StringFlagKey,
+  NumberFlagKey,
+  JsonFlagKey,
+  MultivariateFlagKey,
+
   // Rollout
   RolloutConfig,
   RampStep,

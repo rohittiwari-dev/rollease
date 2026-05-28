@@ -23,6 +23,16 @@
     "targeting-rules",
     "react",
     "nextjs",
+    "vue",
+    "svelte",
+    "angular",
+    "nestjs",
+    "react-native",
+    "express",
+    "fastify",
+    "hono",
+    "koa",
+    "cloudflare-workers",
     "sequelize",
     "prisma",
     "drizzle",
@@ -72,6 +82,46 @@
       "import": "./dist/next.mjs",
       "require": "./dist/next.js"
     },
+    "./vue": {
+      "types": "./dist/vue.d.ts",
+      "import": "./dist/vue.mjs",
+      "require": "./dist/vue.js"
+    },
+    "./svelte": {
+      "types": "./dist/svelte.d.ts",
+      "import": "./dist/svelte.mjs",
+      "require": "./dist/svelte.js"
+    },
+    "./angular": {
+      "types": "./dist/angular.d.ts",
+      "import": "./dist/angular.mjs",
+      "require": "./dist/angular.js"
+    },
+    "./nestjs": {
+      "types": "./dist/nestjs.d.ts",
+      "import": "./dist/nestjs.mjs",
+      "require": "./dist/nestjs.js"
+    },
+    "./react-native": {
+      "types": "./dist/react-native.d.ts",
+      "import": "./dist/react-native.mjs",
+      "require": "./dist/react-native.js"
+    },
+    "./middleware": {
+      "types": "./dist/middleware.d.ts",
+      "import": "./dist/middleware.mjs",
+      "require": "./dist/middleware.js"
+    },
+    "./codegen": {
+      "types": "./dist/codegen.d.ts",
+      "import": "./dist/codegen.mjs",
+      "require": "./dist/codegen.js"
+    },
+    "./migrations": {
+      "types": "./dist/migrations.d.ts",
+      "import": "./dist/migrations.mjs",
+      "require": "./dist/migrations.js"
+    },
     "./db/memory": {
       "types": "./dist/db/memory.d.ts",
       "import": "./dist/db/memory.mjs",
@@ -107,10 +157,20 @@
       "import": "./dist/db/adapter.mjs",
       "require": "./dist/db/adapter.js"
     },
+    "./db/cloudflare-kv": {
+      "types": "./dist/db/cloudflare-kv.d.ts",
+      "import": "./dist/db/cloudflare-kv.mjs",
+      "require": "./dist/db/cloudflare-kv.js"
+    },
     "./core/types": {
       "types": "./dist/core/types.d.ts",
       "import": "./dist/core/types.mjs",
       "require": "./dist/core/types.js"
+    },
+    "./core/flag-types": {
+      "types": "./dist/core/flag-types.d.ts",
+      "import": "./dist/core/flag-types.mjs",
+      "require": "./dist/core/flag-types.js"
     },
     "./core/errors": {
       "types": "./dist/core/errors.d.ts",
@@ -131,6 +191,21 @@
       "types": "./dist/core/internal.d.ts",
       "import": "./dist/core/internal.mjs",
       "require": "./dist/core/internal.js"
+    },
+    "./core/metrics": {
+      "types": "./dist/core/metrics.d.ts",
+      "import": "./dist/core/metrics.mjs",
+      "require": "./dist/core/metrics.js"
+    },
+    "./core/rbac": {
+      "types": "./dist/core/rbac.d.ts",
+      "import": "./dist/core/rbac.mjs",
+      "require": "./dist/core/rbac.js"
+    },
+    "./core/openapi": {
+      "types": "./dist/core/openapi.d.ts",
+      "import": "./dist/core/openapi.mjs",
+      "require": "./dist/core/openapi.js"
     },
     "./engine/evaluator": {
       "types": "./dist/engine/evaluator.d.ts",
@@ -153,15 +228,26 @@
     "clean": "rm -rf dist"
   },
   "peerDependencies": {
+    "@angular/core": ">=17.0.0",
+    "@nestjs/common": ">=10.0.0",
     "@prisma/client": "^5.0.0 || ^6.0.0",
     "drizzle-orm": "^0.36.0",
     "next": "",
     "pg": "^8.13.1",
     "react": "^19.2.6",
+    "react-native": ">=0.72.0",
     "redis": "^4.7.0",
-    "sequelize": "^6.37.0"
+    "sequelize": "^6.37.0",
+    "svelte": ">=4.0.0",
+    "vue": "^3.3.0"
   },
   "peerDependenciesMeta": {
+    "@angular/core": {
+      "optional": true
+    },
+    "@nestjs/common": {
+      "optional": true
+    },
     "@prisma/client": {
       "optional": true
     },
@@ -177,10 +263,19 @@
     "react": {
       "optional": true
     },
+    "react-native": {
+      "optional": true
+    },
     "redis": {
       "optional": true
     },
     "sequelize": {
+      "optional": true
+    },
+    "svelte": {
+      "optional": true
+    },
+    "vue": {
       "optional": true
     }
   },

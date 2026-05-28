@@ -2,9 +2,27 @@
 // Rollease SDK — Core Type System (Feature Flags)
 // ============================================================================
 
+// ── Typed Flag Key Infrastructure ──────────────────────────────────────────
+
+export type {
+  FlagDefinitions,
+  TypedFlagKey,
+  HasFlagDefinitions,
+  FlagTypeToTS,
+  FlagValueType,
+  FlagDefaultValue,
+  BooleanFlagKey,
+  StringFlagKey,
+  NumberFlagKey,
+  JsonFlagKey,
+  MultivariateFlagKey,
+} from './flag-types';
+
+import type { TypedFlagKey } from './flag-types';
+
 // ── Shared Primitives ──────────────────────────────────────────────────────
 
-export type FlagKey = string;
+export type FlagKey = TypedFlagKey;
 export type UserId = string;
 
 // ── Configuration ──────────────────────────────────────────────────────────

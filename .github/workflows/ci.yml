@@ -1,0 +1,154 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  NODE_VERSION: "20"
+  BUN_VERSION: "latest"
+
+permissions:
+  contents: read
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # Lint & Type Check
+  # ─────────────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Type check
+        run: cd packages/rollease && bunx tsc --noEmit
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Unit Tests
+  # ─────────────────────────────────────────────────────────────────────────
+  test:
+    name: Test (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [18, 20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Run tests
+        run: cd packages/rollease && bunx vitest run --reporter=verbose
+      - name: Run tests with coverage
+        if: matrix.node == 20
+        run: cd packages/rollease && bunx vitest run --coverage
+      - name: Upload coverage
+        if: matrix.node == 20
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: packages/rollease/coverage/
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Build
+  # ─────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Build package
+        run: cd packages/rollease && bunx tsup
+      - name: Verify dist contents
+        run: |
+          ls -la packages/rollease/dist/
+          # Verify all entry points exist
+          for f in index client handler testing codegen react next vue svelte angular nestjs react-native middleware openfeature telemetry migrations; do
+            test -f "packages/rollease/dist/${f}.js" || (echo "Missing: dist/${f}.js" && exit 1)
+            test -f "packages/rollease/dist/${f}.mjs" || (echo "Missing: dist/${f}.mjs" && exit 1)
+            test -f "packages/rollease/dist/${f}.d.ts" || test -f "packages/rollease/dist/${f}.d.mts" || (echo "Missing: dist/${f}.d.ts" && exit 1)
+          done
+          echo "✅ All entry points verified"
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: packages/rollease/dist/
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Package Size Check
+  # ─────────────────────────────────────────────────────────────────────────
+  size:
+    name: Package Size
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Build
+        run: cd packages/rollease && bunx tsup
+      - name: Check bundle size
+        run: |
+          SIZE=$(du -sk packages/rollease/dist/ | cut -f1)
+          echo "📦 Total dist size: ${SIZE}KB"
+          # Fail if dist exceeds 2MB
+          if [ "$SIZE" -gt 2048 ]; then
+            echo "❌ Bundle too large: ${SIZE}KB > 2048KB"
+            exit 1
+          fi
+          echo "✅ Bundle size OK"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Release (only on main)
+  # ─────────────────────────────────────────────────────────────────────────
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: [build, size]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Build
+        run: cd packages/rollease && bunx tsup
+      - name: Create Release Tag
+        run: |
+          VERSION=$(node -p "require('./packages/rollease/package.json').version")
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "📦 Version: ${VERSION}"
+      # Uncomment when ready to publish to npm:
+      # - name: Publish to npm
+      #   run: cd packages/rollease && npm publish --provenance
+      #   env:
+      #     NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
