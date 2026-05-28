@@ -3,7 +3,12 @@
 // The main rl.flags API surface.
 // ============================================================================
 
-import type { DbAdapter, CacheAdapter } from "../db/adapter";
+import type {
+  CacheAdapter,
+  DbAdapter,
+  InvalidationBus,
+  InvalidationMessage,
+} from "../db/adapter";
 import type {
   AuditActor,
   Flag,
@@ -51,6 +56,8 @@ import type {
   PrivacyConfig,
   TelemetryAdapter,
   RolleaseHealthResult,
+  TrackEventInput,
+  TrackingEvent,
 } from "../core/types";
 import {
   FlagNotFoundError,
@@ -80,6 +87,13 @@ type ChangeListener = (event: {
 
 const OVERRIDE_CACHE_TTL_MS = 5000;
 const DEFAULT_PAGE_SIZE = 1000;
+const DEFAULT_RETRY_ATTEMPTS = 3;
+const DEFAULT_RETRY_BACKOFF_MS = 100;
+const DEFAULT_CIRCUIT_THRESHOLD = 5;
+const DEFAULT_CIRCUIT_WINDOW_MS = 30_000;
+const DEFAULT_CIRCUIT_RESET_AFTER_MS = 30_000;
+
+type CircuitPhase = "closed" | "open" | "half_open";
 
 export class FlagManager {
   private db: DbAdapter;
@@ -106,6 +120,13 @@ export class FlagManager {
   private cacheHitCount = 0;
   private cacheMissCount = 0;
   private startedAt = Date.now();
+  private invalidationBus?: InvalidationBus;
+  private invalidationUnsubscribe?: () => void;
+  private instanceId = `rl_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+  private circuitPhase: CircuitPhase = "closed";
+  private circuitFailures = 0;
+  private circuitWindowStartedAt = Date.now();
+  private circuitOpenedAt = 0;
 
   constructor(opts: {
     db: DbAdapter;
@@ -124,6 +145,7 @@ export class FlagManager {
     resilience?: ResilienceConfig;
     privacy?: PrivacyConfig;
     telemetry?: TelemetryAdapter;
+    invalidationBus?: InvalidationBus;
   }) {
     this.db = opts.db;
     this.l1Cache = new MemoryCacheAdapter();
@@ -145,6 +167,22 @@ export class FlagManager {
     this.resilience = opts.resilience ?? {};
     this.privacy = opts.privacy ?? {};
     this.telemetry = opts.telemetry;
+    this.invalidationBus = opts.invalidationBus;
+    if (this.invalidationBus) {
+      Promise.resolve(
+        this.invalidationBus.subscribe((message) =>
+          this.handleInvalidation(message)
+        )
+      )
+        .then((unsubscribe) => {
+          this.invalidationUnsubscribe = unsubscribe;
+        })
+        .catch((err) => {
+          this.logger.warn("invalidation bus subscription failed", {
+            err: errMessage(err),
+          });
+        });
+    }
   }
 
   // ── Flag CRUD ────────────────────────────────────────────────────────
@@ -198,19 +236,22 @@ export class FlagManager {
 
     await this.runMutationHook("flag.created", input.key, input.actor);
     const flag = await this.db.createFlag(input);
+    await this.bustCache(input.key);
     this.emit({ flagKey: input.key, action: "created" });
     this.webhookDispatcher.dispatch("flag.created", input.key, { flag });
     return flag;
   }
 
   async get(key: string): Promise<Flag> {
-    const flag = await this.db.getFlag(key);
+    const flag = await this.withDbResilience("getFlag", () => this.db.getFlag(key));
     if (!flag) throw new FlagNotFoundError(key);
     return flag;
   }
 
   async list(filters?: ListFlagsInput): Promise<ListFlagsResult> {
-    return this.db.listFlags(filters || {});
+    return this.withDbResilience("listFlags", () =>
+      this.db.listFlags(filters || {})
+    );
   }
 
   async update(key: string, patch: UpdateFlagInput): Promise<Flag> {
@@ -468,6 +509,8 @@ export class FlagManager {
     context: FlagContext,
     opts?: { keys?: string[]; namespace?: string; tags?: string[] }
   ): Promise<DetailedFlagMap> {
+    if (opts?.keys && opts.keys.length === 0) return {};
+
     let activeContext = context;
     if (this.environment && !activeContext.environment) {
       activeContext = { ...activeContext, environment: this.environment };
@@ -492,13 +535,15 @@ export class FlagManager {
     // table in one shot.
     let offset = 0;
     while (true) {
-      const page = await this.db.getAllActiveFlags({
-        keys: opts?.keys,
-        namespace: opts?.namespace,
-        tags: opts?.tags,
-        limit: this.evaluateAllPageSize,
-        offset,
-      });
+      const page = await this.withDbResilience("getAllActiveFlags", () =>
+        this.db.getAllActiveFlags({
+          keys: opts?.keys,
+          namespace: opts?.namespace,
+          tags: opts?.tags,
+          limit: this.evaluateAllPageSize,
+          offset,
+        })
+      );
       if (page.length === 0) break;
       allFlags.push(...page);
       if (page.length < this.evaluateAllPageSize) break;
@@ -518,10 +563,14 @@ export class FlagManager {
     if (activeContext.userId && filteredFlags.length > 0) {
       const flagKeys = filteredFlags.map((f) => f.key);
       if (typeof this.db.getUserAssignments === "function") {
-        assignments = await this.db.getUserAssignments(flagKeys, activeContext.userId);
+        assignments = await this.withDbResilience("getUserAssignments", () =>
+          this.db.getUserAssignments!(flagKeys, activeContext.userId!)
+        );
       } else {
         for (const key of flagKeys) {
-          const v = await this.db.getUserAssignment(key, activeContext.userId);
+          const v = await this.withDbResilience("getUserAssignment", () =>
+            this.db.getUserAssignment(key, activeContext.userId!)
+          );
           if (v) assignments[key] = v;
         }
       }
@@ -992,18 +1041,36 @@ export class FlagManager {
     const start = Date.now();
     let dbStatus: "ok" | "error" = "ok";
     try {
-      await this.db.listFlags({ limit: 1 });
+      await this.withDbResilience("health.listFlags", () =>
+        this.db.listFlags({ limit: 1 })
+      );
     } catch {
       dbStatus = "error";
     }
+    let cacheStatus: "ok" | "error" | "disabled" = this.l2Cache ? "ok" : "disabled";
+    if (this.l2Cache) {
+      try {
+        const key = "rollease:health";
+        await this.l2Cache.set(key, "ok", 1000);
+        await this.l2Cache.get(key);
+        await this.l2Cache.del(key);
+      } catch {
+        cacheStatus = "error";
+      }
+    }
     const latencyMs = Date.now() - start;
-    const cacheStatus: "ok" | "error" | "disabled" = this.l2Cache ? "ok" : "disabled";
     const total = this.cacheHitCount + this.cacheMissCount;
     const cacheHitRate = total > 0 ? this.cacheHitCount / total : 0;
     return {
-      status: dbStatus === "error" ? "unhealthy" : "healthy",
+      status:
+        dbStatus === "error"
+          ? "unhealthy"
+          : cacheStatus === "error"
+            ? "degraded"
+            : "healthy",
       db: dbStatus,
       cache: cacheStatus,
+      circuit: this.resilience.circuitBreaker ? this.circuitPhase : "disabled",
       latencyMs,
       evalCount: this.evalCount,
       cacheHits: this.cacheHitCount,
@@ -1018,7 +1085,7 @@ export class FlagManager {
 
   async forgetUser(
     userId: string,
-    scope?: Array<"impressions" | "assignments" | "history">
+    scope?: Array<"impressions" | "assignments" | "history" | "events">
   ): Promise<void> {
     if (!this.db.forgetUser) {
       throw new ValidationError(
@@ -1030,6 +1097,29 @@ export class FlagManager {
 
   // ── Scheduled Releases ───────────────────────────────────────────────
 
+  async trackEvent(event: TrackEventInput): Promise<TrackingEvent | void> {
+    if (!event.event || typeof event.event !== "string") {
+      throw new ValidationError("event is required");
+    }
+    if (!this.db.trackEvent) {
+      this.logger.debug("trackEvent skipped: adapter does not support events", {
+        event: event.event,
+      });
+      return;
+    }
+    const safeContext = event.context ? this.scrubContext(event.context) : undefined;
+    return this.withDbResilience("trackEvent", () =>
+      this.db.trackEvent!({ ...event, context: safeContext })
+    );
+  }
+
+  async close(): Promise<void> {
+    this.invalidationUnsubscribe?.();
+    if (this.invalidationBus?.close) {
+      await this.invalidationBus.close();
+    }
+  }
+
   async runScheduledReleases(): Promise<{
     deployed: string[];
     failed: Array<{ id: string; error: string }>;
@@ -1037,7 +1127,9 @@ export class FlagManager {
     if (!this.db.listScheduledReleases) {
       return { deployed: [], failed: [] };
     }
-    const releases = await this.db.listScheduledReleases();
+    const releases = await this.withDbResilience("listScheduledReleases", () =>
+      this.db.listScheduledReleases!()
+    );
     const deployed: string[] = [];
     const failed: Array<{ id: string; error: string }> = [];
     for (const release of releases) {
@@ -1138,11 +1230,13 @@ export class FlagManager {
     const staleAfter = new Date(
       Date.now() - days * 24 * 60 * 60 * 1000
     ).toISOString();
-    const result = await this.db.listFlags({
-      staleAfter,
-      namespace: opts?.namespace,
-      status: "active",
-    });
+    const result = await this.withDbResilience("listFlags", () =>
+      this.db.listFlags({
+        staleAfter,
+        namespace: opts?.namespace,
+        status: "active",
+      })
+    );
     return result.data;
   }
 
@@ -1246,7 +1340,7 @@ export class FlagManager {
           flagKey: key,
           err: errMessage(err),
         });
-        return missingFlagResult<T>(key);
+        return errorFallbackResult<T>(key);
       }
       throw err;
     }
@@ -1325,7 +1419,9 @@ export class FlagManager {
     const rules = await this.getRulesCached(key);
     let assignment: string | null = null;
     if (context.userId) {
-      assignment = await this.db.getUserAssignment(key, context.userId);
+      assignment = await this.withDbResilience("getUserAssignment", () =>
+        this.db.getUserAssignment(key, context.userId!)
+      );
     }
 
     let exclusionLayer: ExclusionLayer | undefined;
@@ -1364,7 +1460,9 @@ export class FlagManager {
    */
   private async resolveSegments(context: FlagContext): Promise<string[]> {
     try {
-      const segments = await this.db.listSegments();
+      const segments = await this.withDbResilience("listSegments", () =>
+        this.db.listSegments()
+      );
       const matched: string[] = [];
       for (const segment of segments) {
         try {
@@ -1388,6 +1486,77 @@ export class FlagManager {
   }
 
   // ── Cache Helpers ────────────────────────────────────────────────────
+
+  private async withDbResilience<T>(
+    operation: string,
+    fn: () => Promise<T>
+  ): Promise<T> {
+    this.throwIfCircuitOpen(operation);
+    const retry = this.resilience.retry;
+    const attempts = retry ? Math.max(1, retry.attempts ?? DEFAULT_RETRY_ATTEMPTS) : 1;
+    const backoffMs = retry?.backoffMs ?? DEFAULT_RETRY_BACKOFF_MS;
+    const jitter = retry?.jitter ?? true;
+    let lastErr: unknown;
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        const result = await fn();
+        this.recordDbSuccess();
+        return result;
+      } catch (err) {
+        lastErr = err;
+        this.recordDbFailure();
+        if (attempt >= attempts || this.circuitPhase === "open") break;
+        await sleep(backoffMsForAttempt(backoffMs, attempt, jitter));
+      }
+    }
+
+    this.logger.warn("database operation failed", {
+      operation,
+      err: errMessage(lastErr),
+    });
+    throw lastErr;
+  }
+
+  private throwIfCircuitOpen(operation: string): void {
+    const cfg = this.resilience.circuitBreaker;
+    if (!cfg || this.circuitPhase !== "open") return;
+    const resetAfterMs = cfg.resetAfterMs ?? DEFAULT_CIRCUIT_RESET_AFTER_MS;
+    if (Date.now() - this.circuitOpenedAt >= resetAfterMs) {
+      this.circuitPhase = "half_open";
+      return;
+    }
+    throw new Error(`Rollease circuit breaker open for ${operation}`);
+  }
+
+  private recordDbSuccess(): void {
+    if (!this.resilience.circuitBreaker) return;
+    this.circuitPhase = "closed";
+    this.circuitFailures = 0;
+    this.circuitWindowStartedAt = Date.now();
+    this.circuitOpenedAt = 0;
+  }
+
+  private recordDbFailure(): void {
+    const cfg = this.resilience.circuitBreaker;
+    if (!cfg) return;
+    const now = Date.now();
+    const windowMs = cfg.windowMs ?? DEFAULT_CIRCUIT_WINDOW_MS;
+    if (now - this.circuitWindowStartedAt > windowMs) {
+      this.circuitWindowStartedAt = now;
+      this.circuitFailures = 0;
+    }
+    this.circuitFailures++;
+    const threshold = cfg.threshold ?? DEFAULT_CIRCUIT_THRESHOLD;
+    if (this.circuitFailures >= threshold || this.circuitPhase === "half_open") {
+      this.circuitPhase = "open";
+      this.circuitOpenedAt = now;
+      this.logger.warn("database circuit breaker opened", {
+        failures: this.circuitFailures,
+        threshold,
+      });
+    }
+  }
 
   private flagCacheKey(key: string): string {
     return `rollease:flag:${key}`;
@@ -1419,7 +1588,7 @@ export class FlagManager {
 
     // DB
     this.cacheMissCount++;
-    const flag = await this.db.getFlag(key);
+    const flag = await this.withDbResilience("getFlag", () => this.db.getFlag(key));
     if (flag) {
       const serialized = JSON.stringify(flag);
       await this.l1Cache.set(cacheKey, serialized, this.l1TtlMs);
@@ -1451,7 +1620,9 @@ export class FlagManager {
       }
     }
 
-    const rules = await this.db.listRules(key);
+    const rules = await this.withDbResilience("listRules", () =>
+      this.db.listRules(key)
+    );
     const serialized = JSON.stringify(rules);
     await this.l1Cache.set(cacheKey, serialized, this.l1TtlMs);
     if (this.l2Cache) {
@@ -1479,7 +1650,9 @@ export class FlagManager {
       }
     }
 
-    const layer = await this.db.getExclusionLayer(key);
+    const layer = await this.withDbResilience("getExclusionLayer", () =>
+      this.db.getExclusionLayer!(key)
+    );
     const serialized = JSON.stringify(layer);
     await this.l1Cache.set(cacheKey, serialized || "null", this.l1TtlMs);
     if (this.l2Cache) {
@@ -1513,7 +1686,10 @@ export class FlagManager {
     if (flag.locked) throw new FlagLockedError(key, flag.lockedReason);
   }
 
-  private async bustCache(key: string): Promise<void> {
+  private async bustCache(
+    key: string,
+    opts?: { publish?: boolean }
+  ): Promise<void> {
     const flagKey = this.flagCacheKey(key);
     const rulesKey = this.rulesCacheKey(key);
     await this.l1Cache.del(flagKey);
@@ -1524,13 +1700,53 @@ export class FlagManager {
       await this.l2Cache.del(rulesKey);
       await this.l2Cache.del("rollease:all");
     }
+    if (opts?.publish !== false) {
+      await this.publishInvalidation({ scope: "flag", key });
+    }
   }
 
-  private async bustAllCaches(): Promise<void> {
+  private async bustAllCaches(opts?: { publish?: boolean }): Promise<void> {
     await this.l1Cache.delPattern("rollease:*");
     if (this.l2Cache?.delPattern) {
       await this.l2Cache.delPattern("rollease:*");
     }
+    if (opts?.publish !== false) {
+      await this.publishInvalidation({ scope: "all" });
+    }
+  }
+
+  private async publishInvalidation(
+    message: Omit<InvalidationMessage, "sourceId" | "ts">
+  ): Promise<void> {
+    if (!this.invalidationBus) return;
+    try {
+      await this.invalidationBus.publish({
+        ...message,
+        sourceId: this.instanceId,
+        ts: Date.now(),
+      });
+    } catch (err) {
+      this.logger.warn("invalidation publish failed", {
+        key: message.key,
+        scope: message.scope,
+        err: errMessage(err),
+      });
+    }
+  }
+
+  private async handleInvalidation(message: InvalidationMessage): Promise<void> {
+    if (message.sourceId === this.instanceId) return;
+    if (message.scope === "all") {
+      await this.bustAllCaches({ publish: false });
+      this.emit({ flagKey: "*", action: "invalidated_all" });
+      return;
+    }
+    if (!message.key) return;
+    await this.bustCache(message.key, { publish: false });
+    this.emit({
+      flagKey: message.key,
+      action: message.action ?? "invalidated",
+    });
   }
 
   private emit(event: { flagKey: string; action: string; value?: unknown }): void {
@@ -1693,6 +1909,29 @@ function missingFlagResult<T>(key: string): FlagResult<T> {
     ruleId: null,
     evaluatedAt: new Date(),
   };
+}
+
+function errorFallbackResult<T>(key: string): FlagResult<T> {
+  return {
+    key,
+    value: null as T,
+    variant: null,
+    enabled: false,
+    reason: "error_fallback",
+    ruleId: null,
+    evaluatedAt: new Date(),
+  };
+}
+
+function sleep(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function backoffMsForAttempt(baseMs: number, attempt: number, jitter: boolean): number {
+  const exponential = baseMs * Math.max(1, 2 ** (attempt - 1));
+  if (!jitter) return exponential;
+  return Math.floor(exponential * (0.5 + Math.random()));
 }
 
 function parseCachedFlag(serialized: string): Flag | null {

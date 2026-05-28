@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { FlagManager } from "../src/engine/manager";
-import { MemoryDbAdapter, MemoryCacheAdapter } from "../src/db/memory";
+import {
+  MemoryDbAdapter,
+  MemoryCacheAdapter,
+  MemoryInvalidationBus,
+} from "../src/db/memory";
 import {
   FlagNotFoundError,
   FlagLockedError,
@@ -264,6 +268,74 @@ describe("Flag Manager API", () => {
     await manager.update("cached", { description: "touched" });
     await manager.isEnabled("cached", { userId: "u1" });
     expect(getFlagSpy.mock.calls.length).toBeGreaterThan(dbCallsAfterFirst);
+  });
+
+  it("invalidates another manager instance through an invalidation bus", async () => {
+    const db = new MemoryDbAdapter();
+    const bus = new MemoryInvalidationBus();
+    const managerA = new FlagManager({ db, invalidationBus: bus, l1TtlMs: 60_000 });
+    const managerB = new FlagManager({ db, invalidationBus: bus, l1TtlMs: 60_000 });
+
+    await managerA.create({ key: "shared.flag", type: "boolean", defaultValue: false });
+    expect((await managerB.evaluate("shared.flag", { userId: "u1" })).value).toBe(false);
+
+    await managerA.update("shared.flag", { defaultValue: true });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect((await managerB.evaluate("shared.flag", { userId: "u1" })).value).toBe(true);
+    await managerA.close();
+    await managerB.close();
+  });
+
+  it("tracks custom events through the database adapter", async () => {
+    const db = new MemoryDbAdapter();
+    const manager = new FlagManager({
+      db,
+      privacy: { privateAttributes: ["email"] },
+    });
+
+    await manager.trackEvent({
+      userId: "u1",
+      event: "checkout_completed",
+      value: 49,
+      context: { userId: "u1", attributes: { email: "a@example.com", plan: "pro" } },
+    });
+
+    const events = await db.listTrackingEvents?.();
+    expect(events).toHaveLength(1);
+    expect(events?.[0].event).toBe("checkout_completed");
+    expect(events?.[0].context?.attributes?.email).toBe("[REDACTED]");
+  });
+
+  it("retries failed DB reads and opens the circuit breaker after repeated failures", async () => {
+    const db = new MemoryDbAdapter();
+    await db.createFlag({ key: "retry.flag", type: "boolean", defaultValue: true });
+    const flag = await db.getFlag("retry.flag");
+    const getFlag = vi.spyOn(db, "getFlag");
+    getFlag.mockRejectedValueOnce(new Error("transient"));
+    getFlag.mockResolvedValueOnce(flag);
+
+    const retrying = new FlagManager({
+      db,
+      resilience: { retry: { attempts: 2, backoffMs: 0, jitter: false } },
+    });
+    expect((await retrying.evaluate("retry.flag", { userId: "u1" })).value).toBe(true);
+    expect(getFlag).toHaveBeenCalledTimes(2);
+
+    getFlag.mockRestore();
+    const brokenDb = new MemoryDbAdapter();
+    vi.spyOn(brokenDb, "getFlag").mockRejectedValue(new Error("down"));
+    const breaker = new FlagManager({
+      db: brokenDb,
+      resilience: {
+        fallbackOnError: true,
+        circuitBreaker: { threshold: 1, windowMs: 1000, resetAfterMs: 1000 },
+      },
+    });
+
+    expect((await breaker.evaluate("any.flag", { userId: "u1" })).reason).toBe("error_fallback");
+    expect((await breaker.evaluate("any.flag", { userId: "u1" })).reason).toBe("error_fallback");
+    expect((await breaker.health()).circuit).toBe("open");
   });
 
   it("invokes hooks: onBeforeMutation can deny, onBeforeEvaluation runs, onEvaluate fires", async () => {

@@ -11,7 +11,11 @@ import { INTERNAL_SECRET } from "./core/internal";
 import { createRolleaseHandler } from "./handler";
 import type { RolleaseConfig, RolleaseHealthResult } from "./core/types";
 import type { CacheAdapter } from "./db/adapter";
-import type { RolleaseHandlerOptions, RolleaseHandler } from "./handler";
+import type {
+  RolleaseHandlerOptions,
+  RolleaseHandler,
+  RolleasePublicClientKeyConfig,
+} from "./handler";
 
 // ── Core Types ─────────────────────────────────────────────────────────────
 export type {
@@ -112,6 +116,8 @@ export type {
   TelemetryAdapter,
   TelemetrySpan,
   RolleaseHealthResult,
+  TrackEventInput,
+  TrackingEvent,
 } from "./core/types";
 
 // ── Errors ─────────────────────────────────────────────────────────────────
@@ -134,7 +140,11 @@ export { FlagManager } from "./engine/manager";
 
 // ── Handler ─────────────────────────────────────────────────────────────────
 export { createRolleaseHandler } from "./handler";
-export type { RolleaseHandlerOptions, RolleaseHandler } from "./handler";
+export type {
+  RolleaseHandlerOptions,
+  RolleaseHandler,
+  RolleasePublicClientKeyConfig,
+} from "./handler";
 
 // ── Telemetry ─────────────────────────────────────────────────────────────
 export { createOtelAdapter, createConsoleAdapter, noopSpan } from "./core/telemetry";
@@ -160,9 +170,25 @@ export { INTERNAL_SECRET } from "./core/internal";
 export { WebhookDispatcher, verifyWebhookSignature } from "./core/webhook";
 
 // ── Database Adapters ──────────────────────────────────────────────────────
-export type { DbAdapter, CacheAdapter } from "./db/adapter";
-export { MemoryDbAdapter, MemoryCacheAdapter, createMemoryAdapter } from "./db/memory";
-export { RedisCacheAdapter, createRedisCache } from "./db/redis";
+export type {
+  DbAdapter,
+  CacheAdapter,
+  InvalidationBus,
+  InvalidationListener,
+  InvalidationMessage,
+} from "./db/adapter";
+export {
+  MemoryDbAdapter,
+  MemoryCacheAdapter,
+  MemoryInvalidationBus,
+  createMemoryAdapter,
+} from "./db/memory";
+export {
+  RedisCacheAdapter,
+  RedisInvalidationBus,
+  createRedisCache,
+  createRedisInvalidationBus,
+} from "./db/redis";
 export {
   ROLLEASE_SEQUELIZE_REQUIRED_COLUMNS,
   SequelizeDbAdapter,
@@ -313,6 +339,7 @@ export function createRollease(config: RolleaseConfig): RolleaseClient {
     resilience: config.resilience,
     privacy: config.privacy,
     telemetry: config.telemetry,
+    invalidationBus: config.invalidation,
   });
 
   // Capture the secret in a closure so it never appears on the public client
@@ -328,6 +355,7 @@ export function createRollease(config: RolleaseConfig): RolleaseClient {
       return createRolleaseHandler(flags, options);
     },
     async close() {
+      await flags.close();
       if (config.db.close) {
         await config.db.close();
       }

@@ -49,6 +49,8 @@ export interface RolleaseConfig {
   privacy?: PrivacyConfig;
   /** OpenTelemetry / custom telemetry integration */
   telemetry?: TelemetryAdapter;
+  /** Cross-process invalidation bus for multi-replica cache/SSE coherence. */
+  invalidation?: import("../db/adapter").InvalidationBus;
 }
 
 export interface ResilienceConfig {
@@ -113,6 +115,7 @@ export interface RolleaseHealthResult {
   status: "healthy" | "degraded" | "unhealthy";
   db: "ok" | "error";
   cache: "ok" | "error" | "disabled";
+  circuit?: "closed" | "open" | "half_open" | "disabled";
   latencyMs: number;
   evalCount: number;
   cacheHits: number;
@@ -127,6 +130,28 @@ export interface ImpressionConfig {
   enabled?: boolean;
   /** Sample rate 0..1 (default 1.0). 0 disables, 1 tracks every evaluation. */
   sampleRate?: number;
+}
+
+export interface TrackEventInput {
+  userId?: string;
+  anonymousId?: string;
+  event: string;
+  value?: number;
+  metadata?: Record<string, unknown>;
+  context?: FlagContext;
+  ts?: number | string | Date;
+}
+
+export interface TrackingEvent {
+  id: string;
+  userId?: string;
+  anonymousId?: string;
+  event: string;
+  value?: number;
+  metadata?: Record<string, unknown>;
+  context?: FlagContext;
+  environment?: string;
+  createdAt: Date;
 }
 
 export interface RolleaseHooks {
@@ -270,6 +295,8 @@ export interface Flag {
   lastEvaluatedAt?: Date | null;
   /** Exclusion layer key this flag belongs to */
   exclusionLayer?: string;
+  /** Whether this flag may be exposed through public browser/client keys. */
+  clientVisible?: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -423,6 +450,7 @@ export type EvalReason =
   | "rule_match"
   | "percentage"
   | "weighted_random"
+  | "error_fallback"
   | "default";
 
 export interface EvaluationTraceStep {
@@ -606,6 +634,8 @@ export interface CreateFlagInput {
   environmentDefaults?: Record<string, unknown>;
   /** Exclusion layer key this flag belongs to */
   exclusionLayer?: string;
+  /** Whether this flag may be exposed through public browser/client keys. */
+  clientVisible?: boolean;
   actor?: AuditActor;
 }
 
@@ -625,6 +655,8 @@ export interface UpdateFlagInput {
   expiresAt?: string | null;
   /** Exclusion layer key this flag belongs to */
   exclusionLayer?: string;
+  /** Whether this flag may be exposed through public browser/client keys. */
+  clientVisible?: boolean;
   actor?: AuditActor;
 }
 
@@ -813,4 +845,3 @@ export interface ExclusionLayer {
   flagKeys: string[];
   allocations: ExclusionLayerAllocation[];
 }
-

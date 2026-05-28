@@ -66,6 +66,18 @@ export interface RolleaseClientConfig {
   /** Extra headers added to every request. */
   headers?: Record<string, string>;
 
+  /** Public client key configured on the Rollease handler. */
+  clientKey?: string;
+
+  /** Number of analytics events to batch before flushing. @default 10 */
+  eventBatchSize?: number;
+
+  /** Maximum delay before flushing analytics events. @default 5000 */
+  eventFlushIntervalMs?: number;
+
+  /** Stable anonymous identifier used for tracking before sign-in. */
+  anonymousId?: string;
+
   /** Called after flags are refreshed. */
   onFlagsChange?: (flags: DetailedFlagMap) => void;
 
@@ -107,6 +119,9 @@ export interface RolleaseBrowserClient {
     props?: { value?: number; metadata?: Record<string, unknown> }
   ): void;
 
+  /** Flush queued analytics events immediately. */
+  flush(): Promise<void>;
+
   /**
    * Subscribe to any flag change.
    * Returns an unsubscribe function.
@@ -145,6 +160,10 @@ export function createRolleaseClient(
     localStorage: useLocalStorage = false,
     localStorageKey = LS_KEY,
     headers: extraHeaders = {},
+    clientKey,
+    eventBatchSize = 10,
+    eventFlushIntervalMs = 5000,
+    anonymousId,
     onFlagsChange,
     onError,
   } = config;
@@ -164,7 +183,15 @@ export function createRolleaseClient(
 
   let eventSource: EventSource | null = null;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let eventFlushTimer: ReturnType<typeof setTimeout> | null = null;
   let destroyed = false;
+  const eventQueue: Array<{
+    userId?: string;
+    anonymousId?: string;
+    event: string;
+    value?: number;
+    metadata?: Record<string, unknown>;
+  }> = [];
 
   // ── Context resolution ────────────────────────────────────────────────────
 
@@ -223,6 +250,9 @@ export function createRolleaseClient(
       "X-Rollease-Context": encodeContext(ctx),
       ...extraHeaders,
     };
+    if (clientKey) {
+      h["X-Rollease-Client-Key"] = clientKey;
+    }
     return h;
   }
 
@@ -242,8 +272,9 @@ export function createRolleaseClient(
     if (typeof EventSource === "undefined") return;
     eventSource?.close();
 
-    const encoded = encodeContext(currentContext);
-    const url = `${baseUrl}/flags/stream?context=${encoded}`;
+    const params = new URLSearchParams({ context: encodeContext(currentContext) });
+    if (clientKey) params.set("clientKey", clientKey);
+    const url = `${baseUrl}/flags/stream?${params.toString()}`;
     eventSource = new EventSource(url);
 
     eventSource.onmessage = (e) => {
@@ -285,6 +316,35 @@ export function createRolleaseClient(
   }
 
   // ── Init ──────────────────────────────────────────────────────────────────
+
+  function scheduleEventFlush(): void {
+    if (eventFlushTimer || eventQueue.length === 0) return;
+    eventFlushTimer = setTimeout(() => {
+      eventFlushTimer = null;
+      flushEvents().catch((e) =>
+        onError?.(e instanceof Error ? e : new Error(String(e)))
+      );
+    }, eventFlushIntervalMs);
+  }
+
+  async function flushEvents(): Promise<void> {
+    if (eventFlushTimer) {
+      clearTimeout(eventFlushTimer);
+      eventFlushTimer = null;
+    }
+    if (eventQueue.length === 0) return;
+    const batch = eventQueue.splice(0, eventQueue.length);
+    const headers = await buildHeaders();
+    const res = await fetch(`${baseUrl}/events`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ events: batch }),
+    });
+    if (!res.ok) {
+      eventQueue.unshift(...batch);
+      throw new Error(`Rollease: event flush failed (${res.status})`);
+    }
+  }
 
   async function init(): Promise<void> {
     // Hydrate from localStorage for zero-flicker on mount
@@ -351,19 +411,23 @@ export function createRolleaseClient(
     },
 
     track(event: string, props?: { value?: number; metadata?: Record<string, unknown> }): void {
-      buildHeaders()
-        .then((h) =>
-          fetch(`${baseUrl}/events`, {
-            method: "POST",
-            headers: h,
-            body: JSON.stringify({
-              userId: currentContext.userId,
-              event,
-              ...props,
-            }),
-          })
-        )
-        .catch(() => { /* fire-and-forget */ });
+      eventQueue.push({
+        userId: currentContext.userId,
+        anonymousId,
+        event,
+        ...props,
+      });
+      if (eventQueue.length >= eventBatchSize) {
+        flushEvents().catch((e) =>
+          onError?.(e instanceof Error ? e : new Error(String(e)))
+        );
+      } else {
+        scheduleEventFlush();
+      }
+    },
+
+    async flush(): Promise<void> {
+      await flushEvents();
     },
 
     onChange(listener: () => void): () => void {
@@ -380,6 +444,11 @@ export function createRolleaseClient(
     destroy(): void {
       destroyed = true;
       stopPolling();
+      if (eventFlushTimer) {
+        clearTimeout(eventFlushTimer);
+        eventFlushTimer = null;
+      }
+      flushEvents().catch(() => { /* fire-and-forget on teardown */ });
       eventSource?.close();
       eventSource = null;
       listeners.clear();

@@ -23,7 +23,29 @@ import type {
   SegmentUsage,
   ExclusionLayer,
   ExclusionLayerAllocation,
+  TrackEventInput,
+  TrackingEvent,
 } from "../core/types";
+
+export interface InvalidationMessage {
+  scope: "flag" | "all";
+  key?: string;
+  action?: string;
+  sourceId?: string;
+  ts?: number;
+}
+
+export type InvalidationListener = (message: InvalidationMessage) => void | Promise<void>;
+
+/**
+ * Cross-process invalidation bus for keeping L1 caches and SSE streams coherent
+ * across multiple SDK instances.
+ */
+export interface InvalidationBus {
+  publish(message: InvalidationMessage): Promise<void>;
+  subscribe(listener: InvalidationListener): Promise<() => void> | (() => void);
+  close?(): Promise<void>;
+}
 
 /**
  * Database adapter interface for all Rollease flag operations.
@@ -183,6 +205,16 @@ export interface DbAdapter {
     reason: string;
   }): Promise<void>;
 
+  /** Record a custom tracking/conversion event. */
+  trackEvent?(event: TrackEventInput): Promise<TrackingEvent>;
+
+  /** Optional test/admin helper for reading tracked events. */
+  listTrackingEvents?(filters?: {
+    userId?: string;
+    event?: string;
+    limit?: number;
+  }): Promise<TrackingEvent[]>;
+
   // ── Bulk Operations ──────────────────────────────────────────────────
 
   /**
@@ -218,7 +250,7 @@ export interface DbAdapter {
    */
   forgetUser?(
     userId: string,
-    scope?: Array<"impressions" | "assignments" | "history">
+    scope?: Array<"impressions" | "assignments" | "history" | "events">
   ): Promise<void>;
 
   // ── Scheduled Releases ───────────────────────────────────────────────

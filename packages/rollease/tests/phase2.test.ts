@@ -120,12 +120,13 @@ describe("Phase 2-A: Edge-safe webhook dispatcher", () => {
 // ── Adapter column contracts ────────────────────────────────────────────────
 
 describe("Phase 2-B/C: Adapter column contracts cover all Tier 2/3 fields", () => {
-  it("repository.Flag contract includes prerequisites/environmentDefaults/exclusionLayer/lastEvaluatedAt", () => {
+  it("repository.Flag contract includes prerequisites/environmentDefaults/exclusionLayer/clientVisible/lastEvaluatedAt", () => {
     expect(ROLLEASE_REPOSITORY_REQUIRED_COLUMNS.Flag).toEqual(
       expect.arrayContaining([
         "prerequisites",
         "environmentDefaults",
         "exclusionLayer",
+        "clientVisible",
         "lastEvaluatedAt",
       ])
     );

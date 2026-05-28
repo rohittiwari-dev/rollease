@@ -1,8 +1,8 @@
-Rollease SDK — Status Report (updated 2026-05-28, eval-trace shipped)
+Rollease SDK — Status Report (updated 2026-05-28, invalidation/resilience/tracking shipped)
 
 ▎ Original audit: compared Rollease against LaunchDarkly Server-SDK 9.x, Statsig 6.x, Unleash 5.x, GrowthBook 1.x, ConfigCat 9.x, OpenFeature 0.7, PostHog across 24 categories.
 ▎ This update: reflects what has actually been implemented since the original audit.
-▎ Build: clean (tsup --dts). Tests: 216 passing across 18 test files.
+▎ Build: last verified clean (tsup --dts). Tests: last verified 222 passing across 19 test files; one additional handler regression was added after that run.
 
 ---
 
@@ -32,19 +32,23 @@ Rollease SDK — Status Report (updated 2026-05-28, eval-trace shipped)
 - ✅ Scheduled-release executor — `rl.flags.runScheduledReleases()` queries `db.listScheduledReleases()`, deploys each, returns `{ deployed, failed }`. Call from your own cron/job queue.
 - ✅ Webhook retry + DLQ — exponential backoff (configurable attempts, backoffMs, jitter). After all retries: calls `config.dlq(payload, lastError)`.
 - ✅ SSE streaming endpoint — `GET /flags/stream` pushes `DetailedFlagMap` on flag change. Browser client subscribes via `EventSource`.
+- ✅ Cross-process invalidation bus — `MemoryInvalidationBus` and `RedisInvalidationBus` let manager instances publish cache/SSE invalidations across replicas when `config.invalidation` is supplied.
+- ✅ Public browser key scoping — handler `clientKeys` require `X-Rollease-Client-Key`/`clientKey`, filter public reads to `clientVisible` or allowlisted flags, and merge server-owned context over caller context.
+- ✅ DB read retry + circuit breaker — `resilience.retry` and `resilience.circuitBreaker` are wired into evaluation read paths; health now reports circuit state and probes L2 cache.
+- ✅ Custom event tracking path — browser `track()` batches events, `/events` accepts batches, `FlagManager.trackEvent()` persists through capable adapters, and MemoryDbAdapter privacy-scrubs/stores events.
 - ✅ Snapshot-based rollback — all three adapters (Memory, Prisma/Repository, Sequelize) capture before-state on deploy, restore on rollback.
 - ✅ Security hardening — segment usage scanner (no JSON.stringify false-positives), override path traversal guard, prototype-pollution key rejection, locked-flag update guard, secret in closure (not on client object), lazy `next/server` import, Edge-safe `fs`.
 - ✅ Example Next.js app — `apps/example/` with middleware, RSC `getFlag`, client `useFlag`, SSE live updates, `/api/rollease/*` handler.
 
 ### Gaps that remain open (ranked by impact)
 
-1. ❌ Redis pub/sub cache invalidation — multi-replica deployments still have up to `l1TtlMs` (5s) stale window per instance.
+1. ✅ Redis pub/sub cache invalidation — `InvalidationBus` abstraction ships with Redis and memory implementations; multi-replica coherence requires passing `config.invalidation`.
 2. ✅ Eval-trace API — `evaluate(key, ctx, { trace: true })` populates `FlagResult.trace` with step-by-step pipeline trace including matched/bypassed status and detail strings. 13 regression tests.
 3. ❌ Typed flag keys + codegen — no compile-time enforcement; typos in flag keys are runtime errors.
-4. ❌ Circuit breaker — `ResilienceConfig.circuitBreaker` type exists; not wired.
+4. ✅ Circuit breaker + DB read retry — now wired into evaluation read paths and health reporting.
 5. ❌ Cloudflare KV / Vercel KV / Deno KV adapters — still no edge-native DB.
 6. ❌ CLI (`npx rollease`) — no scaffolding, export/import, or kill-switch tooling.
-7. ❌ Conversion/metric tracking — no `rl.track()`, no event batching.
+7. ⚠️ Conversion/metric tracking — custom event persistence and browser batching are shipped; exposure dedupe, metric joins, and statistics remain open.
 8. ❌ Multi-tenant storage namespacing.
 9. ❌ Statistical analysis engine.
 10. ❌ Vue, Svelte, React Native, mobile integrations.
@@ -58,7 +62,7 @@ Rollease SDK — Status Report (updated 2026-05-28, eval-trace shipped)
 ├─────────────────────────────────────────────────────┼────────────────────────────┼───────────────────────────────────────────────┤
 │ Server SDK key                                      │ LD ✓, Statsig ✓, Unleash ✓ │ only secret (signing key, not access key)     │
 ├─────────────────────────────────────────────────────┼────────────────────────────┼───────────────────────────────────────────────┤
-│ Client-side SDK key (read-only, public)             │ LD, Statsig, ConfigCat     │ ❌ (browser client uses basePath convention)  │
+│ Client-side SDK key (read-only, public)             │ LD, Statsig, ConfigCat     │ ✅ clientKeys + browser clientKey header/query │
 ├─────────────────────────────────────────────────────┼────────────────────────────┼───────────────────────────────────────────────┤
 │ SDK key rotation                                    │ LD, Statsig                │ ❌                                            │
 ├─────────────────────────────────────────────────────┼────────────────────────────┼───────────────────────────────────────────────┤
@@ -84,10 +88,10 @@ Rollease SDK — Status Report (updated 2026-05-28, eval-trace shipped)
 ├──────────────────────────────────────────────┼───────────────────────────────────────┼──────────────────────────────────────────────────────────┤
 │ Offline / disk-persisted cache               │ LD, Statsig                           │ ⚠️  localStorage in browser client; no server-side disk  │
 ├──────────────────────────────────────────────┼───────────────────────────────────────┼──────────────────────────────────────────────────────────┤
-│ Cross-process invalidation via Redis pub/sub │ LD Redis store                        │ ❌ (multi-replica L1 stale window = l1TtlMs = 5s)        │
+│ Cross-process invalidation via Redis pub/sub │ LD Redis store                        │ ✅ RedisInvalidationBus + MemoryInvalidationBus           │
 └──────────────────────────────────────────────┴───────────────────────────────────────┴──────────────────────────────────────────────────────────┘
 
-Impact: SSE propagation within a single process is now instant. Across replicas the 5s L1 stale window still applies until Redis pub/sub is added.
+Impact: SSE propagation is instant within a process and can be propagated across replicas when an invalidation bus is configured. Without `config.invalidation`, the L1 stale window still applies.
 
 ---
 
@@ -147,7 +151,7 @@ Present (industry parity): percentage rollout, ramp schedule, multivariate weigh
 ├──────────────────────────────────────────────────────────────────┼──────────────────────┼────────────────────────────────────────────────┤
 │ Conversion / metric tracking (track())                           │ LD, Statsig, PostHog │ ❌                                             │
 ├──────────────────────────────────────────────────────────────────┼──────────────────────┼────────────────────────────────────────────────┤
-│ Event batching + flush on interval/size                          │ LD, Statsig          │ ❌ (sync per-eval)                             │
+│ Event batching + flush on interval/size                          │ LD, Statsig          │ ✅ browser track() batches and exposes flush() │
 ├──────────────────────────────────────────────────────────────────┼──────────────────────┼────────────────────────────────────────────────┤
 │ SRM detection, A/A diagnostics, sequential testing              │ Statsig, GrowthBook  │ ❌                                             │
 ├──────────────────────────────────────────────────────────────────┼──────────────────────┼────────────────────────────────────────────────┤
@@ -345,10 +349,10 @@ Routes exposed by the universal handler:
 Present: Memory, Prisma, Drizzle, Sequelize, Redis cache (L1 in-process + L2 Redis).
 
 ✅ L1/L2 cache with per-key bust, negative-cache, and rules-key invalidation
+✅ Cross-process invalidation bus with Redis and memory implementations
 ✅ Batched getUserAssignments (all 3 adapters — single query instead of N round-trips)
 ✅ Paginated getAllActiveFlags (limit/offset streaming in manager.evaluateAll)
 ✅ Snapshot-aware rollback (all 3 adapters)
-❌ Redis pub/sub cache invalidation across replicas
 ❌ Bulk write transactions (deployRelease does N sequential updates)
 ❌ Read replica routing (dbReader vs dbWriter config)
 ❌ Migrations CLI (schema changes between SDK versions break silently)
@@ -365,7 +369,7 @@ Present: Memory, Prisma, Drizzle, Sequelize, Redis cache (L1 in-process + L2 Red
 16. Configuration Management (P1)
 
 ✅ Hot-reload — L1/L2 cache TTL + SSE stream on flag change
-⚠️  Cache invalidation hot-path still limited by l1TtlMs across replicas (see Redis pub/sub gap)
+✅ Cross-process cache/SSE invalidation via `config.invalidation`
 ❌ Config diff (between environments)
 ❌ Promote config env-to-env
 ❌ Dry-run mutation (only previewRelease for releases)
@@ -379,7 +383,7 @@ Present: Memory, Prisma, Drizzle, Sequelize, Redis cache (L1 in-process + L2 Red
 ✅ Paginated evaluateAll (1000-flag page size, configurable)
 ✅ localStorage zero-flicker in browser client
 ✅ Cache hit-rate metrics tracked and exposed in rl.health()
-❌ Redis pub/sub invalidation across replicas
+✅ Redis pub/sub invalidation across replicas when `RedisInvalidationBus` is configured
 ❌ Service Worker cache for browser client
 ❌ Precomputed evaluation tables
 ❌ CDN-cacheable evaluation responses
@@ -399,9 +403,9 @@ Present: Memory, Prisma, Drizzle, Sequelize, Redis cache (L1 in-process + L2 Red
 ├───────────────────────────────────────┼──────────────────────────────┼───────────────────────────────────────────────────────────────────────┤
 │ Webhook dead-letter queue (DLQ)       │ LD                           │ ✅ config.dlq(payload, error) — caller routes to SQS/log/etc.         │
 ├───────────────────────────────────────┼──────────────────────────────┼───────────────────────────────────────────────────────────────────────┤
-│ Circuit breaker                       │ LD                           │ ⚠️  ResilienceConfig.circuitBreaker type exists; not wired            │
+│ Circuit breaker                       │ LD                           │ ✅ ResilienceConfig.circuitBreaker wired into DB read paths           │
 ├───────────────────────────────────────┼──────────────────────────────┼───────────────────────────────────────────────────────────────────────┤
-│ DB-level retry with backoff           │ LD, Statsig                  │ ⚠️  ResilienceConfig.retry type exists; not wired into DB calls       │
+│ DB-level retry with backoff           │ LD, Statsig                  │ ✅ ResilienceConfig.retry wraps evaluation DB reads                   │
 ├───────────────────────────────────────┼──────────────────────────────┼───────────────────────────────────────────────────────────────────────┤
 │ Bulkhead per-tenant                   │ LD                           │ ❌                                                                    │
 └───────────────────────────────────────┴──────────────────────────────┴───────────────────────────────────────────────────────────────────────┘
@@ -432,7 +436,7 @@ Present: Memory, Prisma, Drizzle, Sequelize, Redis cache (L1 in-process + L2 Red
 │ Browser/E2E helpers (Playwright/Cypress) │ LD plugin                                  │ ❌                                                                   │
 └──────────────────────────────────────────┴────────────────────────────────────────────┴──────────────────────────────────────────────────────────────────────┘
 
-Current test suite: 203 tests, 18 test files, all passing. Build: clean (tsup --dts, CJS + ESM + types).
+Current test suite: last verified 222 tests, 19 test files, all passing before the final empty-allowlist handler regression was added. Build: last verified clean (tsup --dts, CJS + ESM + types).
 Coverage: security.ts 94.7% lines, overrides.ts 93.8% lines (plan target was ≥ 90%).
 
 ---
@@ -520,10 +524,10 @@ All Phase 1 security/wiring bugs also fixed:
 
 Priority order:
 
-1. ❌ Redis pub/sub cache invalidation (highest impact — closes the multi-replica stale window)
+1. ✅ Redis pub/sub cache invalidation (InvalidationBus + RedisInvalidationBus shipped)
 2. ✅ Eval-trace API — shipped (evaluate with { trace: true }, 13 tests)
 3. ❌ Typed flag keys via module augmentation + codegen (biggest day-one DX win)
-4. ❌ Circuit breaker + DB-level retry (ResilienceConfig types exist, wire them)
+4. ✅ Circuit breaker + DB-level retry (wired into evaluation DB reads)
 5. ❌ Cloudflare KV adapter, Vercel KV adapter
 6. ❌ CLI (npx rollease flags list, kill, export, import)
 
@@ -534,8 +538,8 @@ Priority order:
 7. ❌ React Native client
 8. ❌ Vue + Svelte integrations
 9. ❌ Express / Fastify / Hono typed middleware wrappers
-10. ❌ Conversion/metric tracking (rl.track())
-11. ❌ Exposure deduplication + event batching
+10. ⚠️ Custom event tracking + browser batching shipped; conversion attribution and metric joins remain open
+11. ❌ Exposure deduplication
 12. ❌ Prometheus metrics endpoint
 
 ---
@@ -557,6 +561,7 @@ Priority order:
 | Area                    | Was (audit)       | Now               |
 |-------------------------|-------------------|-------------------|
 | Browser client          | ❌                | ✅                |
+| Public client keys      | ❌                | ✅                |
 | SSE streaming           | ❌                | ✅                |
 | Admin HTTP handler      | ❌                | ✅                |
 | Test mock client        | ❌                | ✅                |
@@ -571,9 +576,10 @@ Priority order:
 | Snapshot rollback       | ✅                | ✅                |
 | Security hardening      | several gaps      | ✅ all Phase 1 done|
 | Eval-trace API          | ❌                | ✅ shipped        |
-| Redis pub/sub           | ❌                | ❌                |
+| Redis pub/sub           | ❌                | ✅                |
+| Event batching          | ❌                | ✅ browser flush  |
 | Typed flag keys         | ❌                | ❌                |
-| Circuit breaker         | ❌                | ⚠️ type only      |
+| Circuit breaker         | ❌                | ✅                |
 | Vue / Svelte / RN       | ❌                | ❌                |
 | CLI                     | ❌                | ❌                |
 | Multi-tenancy           | ❌                | ❌                |

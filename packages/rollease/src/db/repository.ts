@@ -121,6 +121,7 @@ export const ROLLEASE_REPOSITORY_REQUIRED_COLUMNS: Record<
     "prerequisites",
     "environmentDefaults",
     "exclusionLayer",
+    "clientVisible",
     "lastEvaluatedAt",
     "createdAt",
     "updatedAt",
@@ -218,6 +219,7 @@ export class RepositoryDbAdapter implements DbAdapter {
       prerequisites: input.prerequisites ?? null,
       environmentDefaults: input.environmentDefaults ?? null,
       exclusionLayer: input.exclusionLayer ?? null,
+      clientVisible: input.clientVisible ?? false,
       lastEvaluatedAt: null,
       createdAt: now,
       updatedAt: now,
@@ -369,6 +371,7 @@ export class RepositoryDbAdapter implements DbAdapter {
       rollout: includeRollout ? source.rollout : undefined,
       scheduledAt: source.scheduledAt ? new Date(source.scheduledAt).toISOString() : null,
       expiresAt: source.expiresAt ? new Date(source.expiresAt).toISOString() : null,
+      clientVisible: source.clientVisible,
     });
 
     if (includeRules) {
@@ -1096,6 +1099,7 @@ export function toFlag(row: unknown): Flag {
         ? (data.environmentDefaults as Record<string, unknown>)
         : undefined,
     exclusionLayer: optionalString(data.exclusionLayer),
+    clientVisible: Boolean(data.clientVisible),
     lastEvaluatedAt: nullableDate(data.lastEvaluatedAt),
     createdAt: date(data.createdAt),
     updatedAt: date(data.updatedAt),

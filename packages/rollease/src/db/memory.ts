@@ -3,7 +3,13 @@
 // For development, testing, and prototyping.
 // ============================================================================
 
-import type { DbAdapter, CacheAdapter } from "./adapter";
+import type {
+  CacheAdapter,
+  DbAdapter,
+  InvalidationBus,
+  InvalidationListener,
+  InvalidationMessage,
+} from "./adapter";
 import type {
   Flag,
   FlagRule,
@@ -25,6 +31,8 @@ import type {
   SegmentUsage,
   ExclusionLayer,
   ExclusionLayerAllocation,
+  TrackEventInput,
+  TrackingEvent,
 } from "../core/types";
 import {
   FlagNotFoundError,
@@ -52,6 +60,7 @@ export class MemoryDbAdapter implements DbAdapter {
   private exclusionLayers = new Map<string, ExclusionLayer>();
   private history: HistoryEntry[] = [];
   private impressions: Array<Record<string, unknown>> = [];
+  private trackingEvents: TrackingEvent[] = [];
 
   private genId(prefix: string = "id"): string {
     return `${prefix}_${++this.idCounter}_${Date.now().toString(36)}`;
@@ -84,6 +93,7 @@ export class MemoryDbAdapter implements DbAdapter {
       environmentDefaults: input.environmentDefaults,
       lastEvaluatedAt: null,
       exclusionLayer: input.exclusionLayer,
+      clientVisible: input.clientVisible ?? false,
       createdAt: now,
       updatedAt: now,
     };
@@ -898,7 +908,7 @@ export class MemoryDbAdapter implements DbAdapter {
 
   async forgetUser(
     userId: string,
-    scope?: Array<"impressions" | "assignments" | "history">
+    scope?: Array<"impressions" | "assignments" | "history" | "events">
   ): Promise<void> {
     const all = !scope || scope.length === 0;
 
@@ -926,6 +936,43 @@ export class MemoryDbAdapter implements DbAdapter {
         return true;
       });
     }
+
+    if (all || scope!.includes("events")) {
+      this.trackingEvents = this.trackingEvents.filter(
+        (event) => event.userId !== userId
+      );
+    }
+  }
+
+  async trackEvent(event: TrackEventInput): Promise<TrackingEvent> {
+    const tracked: TrackingEvent = {
+      id: this.genId("event"),
+      userId: event.userId,
+      anonymousId: event.anonymousId,
+      event: event.event,
+      value: event.value,
+      metadata: event.metadata,
+      context: event.context,
+      createdAt: event.ts ? new Date(event.ts) : new Date(),
+    };
+    this.trackingEvents.push(tracked);
+    return tracked;
+  }
+
+  async listTrackingEvents(filters?: {
+    userId?: string;
+    event?: string;
+    limit?: number;
+  }): Promise<TrackingEvent[]> {
+    let events = [...this.trackingEvents];
+    if (filters?.userId) {
+      events = events.filter((event) => event.userId === filters.userId);
+    }
+    if (filters?.event) {
+      events = events.filter((event) => event.event === filters.event);
+    }
+    const limit = filters?.limit ?? events.length;
+    return events.slice(-limit);
   }
 
   // ── Scheduled Releases ────────────────────────────────────────────────
@@ -974,6 +1021,35 @@ export class MemoryCacheAdapter implements CacheAdapter {
         this.store.delete(key);
       }
     }
+  }
+}
+
+/**
+ * In-process invalidation bus useful for tests and single-process workers.
+ * Pass the same instance to multiple FlagManagers to simulate cross-replica
+ * cache/SSE invalidation.
+ */
+export class MemoryInvalidationBus implements InvalidationBus {
+  private listeners = new Set<InvalidationListener>();
+
+  async publish(message: InvalidationMessage): Promise<void> {
+    const payload = { ...message, ts: message.ts ?? Date.now() };
+    await Promise.all(
+      Array.from(this.listeners).map(async (listener) => {
+        await listener(payload);
+      })
+    );
+  }
+
+  subscribe(listener: InvalidationListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  async close(): Promise<void> {
+    this.listeners.clear();
   }
 }
 

@@ -1,11 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { RedisCacheAdapter, createRedisCache } from "../src/db/redis";
+import {
+  RedisCacheAdapter,
+  RedisInvalidationBus,
+  createRedisCache,
+  createRedisInvalidationBus,
+} from "../src/db/redis";
 
 class FakeRedisClient {
   isOpen = false;
   store = new Map<string, string>();
   connected = 0;
   closed = 0;
+  listeners = new Map<string, Set<(message: string) => void>>();
 
   async connect() {
     this.connected += 1;
@@ -40,6 +46,25 @@ class FakeRedisClient {
     this.closed += 1;
     this.isOpen = false;
   }
+
+  duplicate() {
+    return this;
+  }
+
+  async publish(channel: string, message: string) {
+    for (const listener of this.listeners.get(channel) ?? []) {
+      listener(message);
+    }
+  }
+
+  async subscribe(channel: string, listener: (message: string) => void) {
+    if (!this.listeners.has(channel)) this.listeners.set(channel, new Set());
+    this.listeners.get(channel)!.add(listener);
+  }
+
+  async unsubscribe(channel: string) {
+    this.listeners.delete(channel);
+  }
 }
 
 describe("RedisCacheAdapter", () => {
@@ -71,6 +96,21 @@ describe("RedisCacheAdapter", () => {
 
   it("should expose factory helper", () => {
     expect(createRedisCache()).toBeInstanceOf(RedisCacheAdapter);
+  });
+
+  it("publishes and subscribes invalidation messages", async () => {
+    const client = new FakeRedisClient();
+    const bus = new RedisInvalidationBus({ client, channel: "rl:test" });
+    const seen: unknown[] = [];
+
+    await bus.subscribe((message) => {
+      seen.push(message);
+    });
+    await bus.publish({ scope: "flag", key: "checkout" });
+
+    expect(seen).toMatchObject([{ scope: "flag", key: "checkout" }]);
+    expect(createRedisInvalidationBus()).toBeInstanceOf(RedisInvalidationBus);
+    await bus.close();
   });
 });
 

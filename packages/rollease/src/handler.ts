@@ -30,6 +30,17 @@
 import type { FlagManager } from "./engine/manager";
 import type { FlagContext } from "./core/types";
 
+export interface RolleasePublicClientKeyConfig {
+  /** Explicit flag keys this public key can evaluate. */
+  flags?: string[];
+  /** Environment names this public key can evaluate. */
+  environments?: string[];
+  /** Require flags to be marked `clientVisible`. Defaults to true. */
+  requireClientVisible?: boolean;
+  /** Server-owned context merged over caller-supplied context. */
+  context?: FlagContext | ((req: Request) => FlagContext | Promise<FlagContext>);
+}
+
 // ── Public types ─────────────────────────────────────────────────────────────
 
 export interface RolleaseHandlerOptions {
@@ -58,6 +69,11 @@ export interface RolleaseHandlerOptions {
    * @default '*'
    */
   cors?: string | false;
+  /**
+   * Public browser/client keys. When provided, public evaluation and event
+   * routes require `X-Rollease-Client-Key` or `?clientKey=...`.
+   */
+  clientKeys?: Record<string, RolleasePublicClientKeyConfig>;
 }
 
 /** A fetch-compatible Rollease HTTP handler.  Pass directly as a Next.js route handler. */
@@ -74,6 +90,7 @@ export function createRolleaseHandler(
     adminAuth,
     basePath = "/api/rollease",
     cors = "*",
+    clientKeys,
   } = options;
 
   const enc = new TextEncoder();
@@ -86,7 +103,7 @@ export function createRolleaseHandler(
       "Access-Control-Allow-Origin": cors,
       "Access-Control-Allow-Methods": "GET, POST, PATCH, DELETE, OPTIONS",
       "Access-Control-Allow-Headers":
-        "Content-Type, Authorization, X-Rollease-Context",
+        "Content-Type, Authorization, X-Rollease-Context, X-Rollease-Client-Key",
       "Access-Control-Max-Age": "86400",
     };
   }
@@ -154,6 +171,83 @@ export function createRolleaseHandler(
     }
   }
 
+  function getClientKey(req: Request): string | null {
+    const header = req.headers.get("x-rollease-client-key");
+    if (header) return header;
+    const url = new URL(req.url);
+    return url.searchParams.get("clientKey");
+  }
+
+  async function resolvePublicAccess(
+    req: Request
+  ): Promise<{ ok: true; config?: RolleasePublicClientKeyConfig } | { ok: false; status: number; message: string }> {
+    if (!clientKeys) return { ok: true };
+    const key = getClientKey(req);
+    if (!key) return { ok: false, status: 401, message: "client key is required" };
+    const config = clientKeys[key];
+    if (!config) return { ok: false, status: 401, message: "invalid client key" };
+    return { ok: true, config };
+  }
+
+  async function resolvePublicContext(
+    req: Request,
+    config?: RolleasePublicClientKeyConfig
+  ): Promise<FlagContext> {
+    const callerContext = await resolveContext(req);
+    const ownedContext =
+      typeof config?.context === "function"
+        ? await config.context(req)
+        : config?.context;
+    return { ...callerContext, ...(ownedContext ?? {}) };
+  }
+
+  async function getPublicKeys(
+    config?: RolleasePublicClientKeyConfig
+  ): Promise<string[] | undefined> {
+    if (!config) return undefined;
+    if (config.flags) return config.flags;
+    const requireVisible = config.requireClientVisible ?? true;
+    const out: string[] = [];
+    let offset = 0;
+    const limit = 1000;
+    while (true) {
+      const page = await manager.list({ status: "active", limit, offset });
+      for (const flag of page.data) {
+        if (requireVisible && !flag.clientVisible) continue;
+        if (
+          config.environments?.length &&
+          flag.environments?.length &&
+          !flag.environments.some((env) => config.environments!.includes(env))
+        ) {
+          continue;
+        }
+        out.push(flag.key);
+      }
+      if (!page.hasMore) break;
+      offset += page.data.length;
+    }
+    return out;
+  }
+
+  async function canEvaluatePublicFlag(
+    key: string,
+    config?: RolleasePublicClientKeyConfig
+  ): Promise<boolean> {
+    if (!config) return true;
+    if (config.flags) return config.flags.includes(key);
+    const flag = await manager.get(key).catch(() => null);
+    if (!flag) return false;
+    if ((config.requireClientVisible ?? true) && !flag.clientVisible) return false;
+    if (
+      config.environments?.length &&
+      flag.environments?.length &&
+      !flag.environments.some((env) => config.environments!.includes(env))
+    ) {
+      return false;
+    }
+    return true;
+  }
+
   function errName(e: unknown): string {
     return (e as { name?: string }).name ?? "";
   }
@@ -185,9 +279,12 @@ export function createRolleaseHandler(
 
     // ── Evaluate all flags (GET /flags) ────────────────────────────────────
     if (route === "flags" && method === "GET") {
-      const ctx = await resolveContext(req);
+      const access = await resolvePublicAccess(req);
+      if (!access.ok) return err(access.message, access.status);
+      const ctx = await resolvePublicContext(req, access.config);
       try {
-        const flags = await manager.evaluateAllDetailed(ctx);
+        const keys = await getPublicKeys(access.config);
+        const flags = await manager.evaluateAllDetailed(ctx, keys ? { keys } : undefined);
         return json({ flags, ts: Date.now() });
       } catch (e) {
         return err(errMsg(e), 500);
@@ -196,14 +293,17 @@ export function createRolleaseHandler(
 
     // ── SSE stream (GET /flags/stream) ─────────────────────────────────────
     if (route === "flags/stream" && method === "GET") {
-      const ctx = await resolveContext(req);
+      const access = await resolvePublicAccess(req);
+      if (!access.ok) return err(access.message, access.status);
+      const ctx = await resolvePublicContext(req, access.config);
+      const keys = await getPublicKeys(access.config);
       let unsub: (() => void) | null = null;
 
       const stream = new ReadableStream({
         async start(controller) {
           const push = async () => {
             try {
-              const flags = await manager.evaluateAllDetailed(ctx);
+              const flags = await manager.evaluateAllDetailed(ctx, keys ? { keys } : undefined);
               const line = `data: ${JSON.stringify({ flags, ts: Date.now() })}\n\n`;
               controller.enqueue(enc.encode(line));
             } catch {
@@ -238,7 +338,12 @@ export function createRolleaseHandler(
     // ── Evaluate single flag (GET /flags/:key) ─────────────────────────────
     if (parts[0] === "flags" && parts.length === 2 && method === "GET") {
       const key = decodeURIComponent(parts[1]);
-      const ctx = await resolveContext(req);
+      const access = await resolvePublicAccess(req);
+      if (!access.ok) return err(access.message, access.status);
+      if (!(await canEvaluatePublicFlag(key, access.config))) {
+        return err(`Flag "${key}" not found`, 404);
+      }
+      const ctx = await resolvePublicContext(req, access.config);
       try {
         const result = await manager.evaluate(key, ctx);
         return json({ ...result, ts: Date.now() });
@@ -250,18 +355,33 @@ export function createRolleaseHandler(
 
     // ── Track event (POST /events) ─────────────────────────────────────────
     if (route === "events" && method === "POST") {
+      const access = await resolvePublicAccess(req);
+      if (!access.ok) return err(access.message, access.status);
       try {
+        const ctx = await resolvePublicContext(req, access.config);
         const body = (await req.json()) as {
           userId?: string;
+          anonymousId?: string;
           event: string;
           value?: number;
           metadata?: Record<string, unknown>;
+          events?: Array<{
+            userId?: string;
+            anonymousId?: string;
+            event: string;
+            value?: number;
+            metadata?: Record<string, unknown>;
+          }>;
         };
-        if (!body.event) return err("event is required", 400);
-        // No-op if adapter doesn't support event tracking yet
-        const m = manager as unknown as { trackEvent?: (e: unknown) => Promise<void> };
-        if (typeof m.trackEvent === "function") {
-          await m.trackEvent(body);
+        const events = Array.isArray(body.events) ? body.events : [body];
+        if (events.length === 0) return err("event is required", 400);
+        for (const event of events) {
+          if (!event.event) return err("event is required", 400);
+          await manager.trackEvent({
+            ...event,
+            userId: event.userId ?? ctx.userId,
+            context: ctx,
+          });
         }
         return new Response(null, { status: 204, headers: corsHeaders() });
       } catch {
