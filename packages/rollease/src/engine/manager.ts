@@ -47,6 +47,10 @@ import type {
   ExclusionLayer,
   ExclusionLayerAllocation,
   MultiContext,
+  ResilienceConfig,
+  PrivacyConfig,
+  TelemetryAdapter,
+  RolleaseHealthResult,
 } from "../core/types";
 import {
   FlagNotFoundError,
@@ -95,6 +99,13 @@ export class FlagManager {
   private environment?: string;
   private overrideCache: Record<string, unknown> | null = null;
   private overrideReadAt = 0;
+  private resilience: ResilienceConfig;
+  private privacy: PrivacyConfig;
+  private telemetry?: TelemetryAdapter;
+  private evalCount = 0;
+  private cacheHitCount = 0;
+  private cacheMissCount = 0;
+  private startedAt = Date.now();
 
   constructor(opts: {
     db: DbAdapter;
@@ -110,6 +121,9 @@ export class FlagManager {
     autoResolveSegments?: boolean;
     webhooks?: WebhookConfig[];
     environment?: string;
+    resilience?: ResilienceConfig;
+    privacy?: PrivacyConfig;
+    telemetry?: TelemetryAdapter;
   }) {
     this.db = opts.db;
     this.l1Cache = new MemoryCacheAdapter();
@@ -128,6 +142,9 @@ export class FlagManager {
     this.autoResolveSegments = opts.autoResolveSegments ?? false;
     this.webhookDispatcher = new WebhookDispatcher(opts.webhooks || [], this.logger);
     this.environment = opts.environment;
+    this.resilience = opts.resilience ?? {};
+    this.privacy = opts.privacy ?? {};
+    this.telemetry = opts.telemetry;
   }
 
   // ── Flag CRUD ────────────────────────────────────────────────────────
@@ -969,6 +986,75 @@ export class FlagManager {
     return this.db.listReleases(filters);
   }
 
+  // ── Health ───────────────────────────────────────────────────────────
+
+  async health(): Promise<RolleaseHealthResult> {
+    const start = Date.now();
+    let dbStatus: "ok" | "error" = "ok";
+    try {
+      await this.db.listFlags({ limit: 1 });
+    } catch {
+      dbStatus = "error";
+    }
+    const latencyMs = Date.now() - start;
+    const cacheStatus: "ok" | "error" | "disabled" = this.l2Cache ? "ok" : "disabled";
+    const total = this.cacheHitCount + this.cacheMissCount;
+    const cacheHitRate = total > 0 ? this.cacheHitCount / total : 0;
+    return {
+      status: dbStatus === "error" ? "unhealthy" : "healthy",
+      db: dbStatus,
+      cache: cacheStatus,
+      latencyMs,
+      evalCount: this.evalCount,
+      cacheHits: this.cacheHitCount,
+      cacheMisses: this.cacheMissCount,
+      cacheHitRate,
+      uptimeMs: Date.now() - this.startedAt,
+      ts: Date.now(),
+    };
+  }
+
+  // ── Privacy / GDPR ───────────────────────────────────────────────────
+
+  async forgetUser(
+    userId: string,
+    scope?: Array<"impressions" | "assignments" | "history">
+  ): Promise<void> {
+    if (!this.db.forgetUser) {
+      throw new ValidationError(
+        "forgetUser is not supported by the current database adapter"
+      );
+    }
+    await this.db.forgetUser(userId, scope);
+  }
+
+  // ── Scheduled Releases ───────────────────────────────────────────────
+
+  async runScheduledReleases(): Promise<{
+    deployed: string[];
+    failed: Array<{ id: string; error: string }>;
+  }> {
+    if (!this.db.listScheduledReleases) {
+      return { deployed: [], failed: [] };
+    }
+    const releases = await this.db.listScheduledReleases();
+    const deployed: string[] = [];
+    const failed: Array<{ id: string; error: string }> = [];
+    for (const release of releases) {
+      try {
+        await this.deployRelease(release.id);
+        deployed.push(release.id);
+      } catch (err) {
+        failed.push({ id: release.id, error: errMessage(err) });
+        this.logger.warn("scheduled release deployment failed", {
+          releaseId: release.id,
+          err: errMessage(err),
+        });
+      }
+    }
+    return { deployed, failed };
+  }
+
   // ── Tags ─────────────────────────────────────────────────────────────
 
   async addTags(
@@ -1144,9 +1230,26 @@ export class FlagManager {
    */
   async evaluate<T = unknown>(
     key: string,
-    context: FlagContext
+    context: FlagContext,
+    callOptions?: { trace?: boolean }
   ): Promise<FlagResult<T>> {
-    return this.evaluateInternal<T>(key, context);
+    this.evalCount++;
+    const span = this.telemetry?.startSpan("rollease.evaluate", { "flag.key": key });
+    try {
+      const result = await this.evaluateInternal<T>(key, context, undefined, callOptions?.trace);
+      span?.end("ok");
+      return result;
+    } catch (err) {
+      span?.end("error", err instanceof Error ? err : new Error(String(err)));
+      if (this.resilience.fallbackOnError) {
+        this.logger.warn("evaluate failed, returning fallback", {
+          flagKey: key,
+          err: errMessage(err),
+        });
+        return missingFlagResult<T>(key);
+      }
+      throw err;
+    }
   }
 
   // ── Private Helpers ──────────────────────────────────────────────────
@@ -1159,7 +1262,8 @@ export class FlagManager {
   private async evaluateInternal<T = unknown>(
     key: string,
     context: FlagContext,
-    prereqChain?: Set<string>
+    prereqChain?: Set<string>,
+    trace?: boolean
   ): Promise<FlagResult<T>> {
     if (this.environment && !context.environment) {
       context = { ...context, environment: this.environment };
@@ -1239,6 +1343,7 @@ export class FlagManager {
       prerequisiteResults,
       exclusionLayer,
       onWarning: (msg, meta) => this.logger.warn(msg, meta),
+      trace,
     });
 
     this.maybeTrackImpression(result, context);
@@ -1298,6 +1403,7 @@ export class FlagManager {
     // L1
     const l1Hit = await this.l1Cache.get(cacheKey);
     if (l1Hit !== null) {
+      this.cacheHitCount++;
       return parseCachedFlag(l1Hit);
     }
 
@@ -1305,12 +1411,14 @@ export class FlagManager {
     if (this.l2Cache) {
       const l2Hit = await this.l2Cache.get(cacheKey);
       if (l2Hit !== null) {
+        this.cacheHitCount++;
         await this.l1Cache.set(cacheKey, l2Hit, this.l1TtlMs);
         return parseCachedFlag(l2Hit);
       }
     }
 
     // DB
+    this.cacheMissCount++;
     const flag = await this.db.getFlag(key);
     if (flag) {
       const serialized = JSON.stringify(flag);
@@ -1482,11 +1590,12 @@ export class FlagManager {
     ) {
       return;
     }
+    const safe = this.scrubContext(context);
     // Fire-and-forget — never block evaluation on impression IO.
     this.db
       .trackImpression({
         flagKey: result.key,
-        userId: context.userId,
+        userId: safe.userId!,
         value: result.value,
         variant: result.variant,
         reason: result.reason,
@@ -1497,6 +1606,15 @@ export class FlagManager {
           err: errMessage(err),
         })
       );
+  }
+
+  private scrubContext(ctx: FlagContext): FlagContext {
+    if (!this.privacy.privateAttributes?.length) return ctx;
+    const attrs = { ...(ctx.attributes ?? {}) };
+    for (const k of this.privacy.privateAttributes) {
+      if (k in attrs) attrs[k] = "[REDACTED]";
+    }
+    return { ...ctx, attributes: attrs };
   }
 
   // ── Prerequisite Validation ───────────────────────────────────────────

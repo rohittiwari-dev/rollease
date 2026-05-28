@@ -42,6 +42,18 @@ describe("Local Developer Overrides", () => {
     expect(loadLocalOverrides("../../../etc/passwd")).toEqual({});
   });
 
+  it("returns {} when JSON is valid but not an object (array, number, null)", () => {
+    // Covers the `return {}` branch after `!Array.isArray(parsed)` check.
+    fs.writeFileSync(tempFile1, "[]");
+    expect(loadLocalOverrides("temp_override_1.json")).toEqual({});
+
+    fs.writeFileSync(tempFile1, "42");
+    expect(loadLocalOverrides("temp_override_1.json")).toEqual({});
+
+    fs.writeFileSync(tempFile1, "null");
+    expect(loadLocalOverrides("temp_override_1.json")).toEqual({});
+  });
+
   it("isolates state between FlagManager instances (no shared cache)", async () => {
     fs.writeFileSync(tempFile1, JSON.stringify({ shared_key: "from-file-1" }));
     fs.writeFileSync(tempFile2, JSON.stringify({ shared_key: "from-file-2" }));

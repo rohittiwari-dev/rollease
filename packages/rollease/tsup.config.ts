@@ -3,6 +3,11 @@ import { defineConfig } from "tsup";
 export default defineConfig({
   entry: {
     index: "src/index.ts",
+    client: "src/client/index.ts",
+    handler: "src/handler.ts",
+    testing: "src/testing/index.ts",
+    openfeature: "src/frameworks/openfeature.ts",
+    telemetry: "src/core/telemetry.ts",
     react: "src/frameworks/react.ts",
     next: "src/frameworks/next.ts",
     "db/adapter": "src/db/adapter.ts",

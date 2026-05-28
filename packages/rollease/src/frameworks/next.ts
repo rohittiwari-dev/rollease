@@ -491,3 +491,41 @@ function isDetailedFlagMap(
   }
   return true;
 }
+
+// ── Universal handler → Next.js route handler adapter ────────────────────────
+
+/**
+ * Wraps a Rollease universal handler (from `rl.createHandler()`) into the
+ * named-export shape that Next.js App Router route handlers expect.
+ *
+ * Usage in `app/api/rollease/[...path]/route.ts`:
+ * ```ts
+ * import { rl } from '@/lib/rollease'
+ * import { toNextHandlers } from 'rollease/next'
+ *
+ * export const { GET, POST, PATCH, DELETE } = toNextHandlers(
+ *   rl.createHandler({
+ *     contextFromRequest: async (req) => ({ userId: await getServerUserId(req) }),
+ *   })
+ * )
+ * ```
+ *
+ * Note: `rl.createHandler()` already returns a fetch-compatible handler that
+ * Next.js App Router accepts directly.  This helper is purely for convenience
+ * when you prefer the named-export destructuring pattern.
+ */
+export function toNextHandlers(handler: (req: Request) => Promise<Response>): {
+  GET: (req: Request) => Promise<Response>;
+  POST: (req: Request) => Promise<Response>;
+  PATCH: (req: Request) => Promise<Response>;
+  DELETE: (req: Request) => Promise<Response>;
+  OPTIONS: (req: Request) => Promise<Response>;
+} {
+  return {
+    GET: handler,
+    POST: handler,
+    PATCH: handler,
+    DELETE: handler,
+    OPTIONS: handler,
+  };
+}

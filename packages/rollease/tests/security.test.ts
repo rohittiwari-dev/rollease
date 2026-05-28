@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   isSafeFlagKey,
   assertSafeFlagKey,
+  assertSafeConditionGroup,
+  findUnsafeConditionIssue,
   conditionReferencesSegment,
   walkConditions,
   validateOverridePath,
@@ -136,6 +138,59 @@ describe("Security helpers", () => {
       );
       expect(stopped).toBe(true);
       expect(seen).toEqual(["a", "b", "STOP"]);
+    });
+
+    it("returns false for non-group input", () => {
+      expect(walkConditions(null as never, () => true)).toBe(false);
+      expect(walkConditions("string" as never, () => true)).toBe(false);
+    });
+  });
+
+  describe("findUnsafeConditionIssue edge cases", () => {
+    it("rejects when a child is neither a leaf nor a group (primitive in array)", () => {
+      const issue = findUnsafeConditionIssue(
+        // @ts-expect-error — intentionally malformed: string in all array
+        { all: ["not-a-leaf-or-group"] },
+        "conditions"
+      );
+      expect(issue).toMatch(/must be a condition leaf or group/);
+    });
+
+    it("rejects when all/any/none is not an array", () => {
+      const issue = findUnsafeConditionIssue(
+        // @ts-expect-error — intentionally malformed: string instead of array
+        { all: "not-an-array" },
+        "conditions"
+      );
+      expect(issue).toMatch(/must be an array/);
+    });
+
+    it("rejects when condition count exceeds MAX_CONDITION_NODES (100)", () => {
+      // MAX_CONDITION_NODES counts group calls, not leaves. Build a branching
+      // tree: depth=2 with 10 branches each → 1 + 10 + 100 = 111 groups.
+      type Group = { any?: unknown[]; all?: unknown[] };
+      function makeGroup(depth: number): Group {
+        if (depth === 0) {
+          return { all: [{ dimension: "userId", op: "eq", value: "u" }] };
+        }
+        return { any: Array.from({ length: 10 }, () => makeGroup(depth - 1)) };
+      }
+      const issue = findUnsafeConditionIssue(makeGroup(2) as never, "conditions");
+      expect(typeof issue).toBe("string");
+      expect(issue).toMatch(/exceeds maximum condition count/);
+    });
+
+    it("returns null and does not throw for a valid condition group", () => {
+      const issue = findUnsafeConditionIssue(
+        { all: [{ dimension: "userId", op: "eq", value: "u1" }] },
+        "conditions"
+      );
+      expect(issue).toBeNull();
+      expect(() =>
+        assertSafeConditionGroup(
+          { any: [{ dimension: "region", op: "eq", value: "us" }] }
+        )
+      ).not.toThrow();
     });
   });
 

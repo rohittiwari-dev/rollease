@@ -5,6 +5,7 @@
 
 import * as React from "react";
 import type { FlagResult, FlagMap, Variant, EvalReason } from "../core/types";
+import type { RolleaseBrowserClient } from "../client/index";
 
 // ── Context ────────────────────────────────────────────────────────────────
 
@@ -30,16 +31,24 @@ const RolleaseContext = React.createContext<RolleaseContextValue | null>(null);
 // ── Provider ───────────────────────────────────────────────────────────────
 
 export interface RolleaseProviderProps {
+  /**
+   * A `RolleaseBrowserClient` from `rollease/client`.
+   * When provided, the provider subscribes to real-time flag changes
+   * from the client and exposes `refetch()` / `identify()` via context.
+   * Takes precedence over `flagsUrl`.
+   */
+  client?: RolleaseBrowserClient;
   /** Pre-evaluated flag values (key → value map or FlagResult map) */
   initialFlags?: FlagMap | Record<string, FlagResult>;
   /**
    * URL to fetch flags from. When set, flags are fetched on mount
    * and optionally polled at `refreshInterval`.
+   * Ignored when `client` is provided.
    */
   flagsUrl?: string;
   /**
    * Polling interval in ms (default: 30000). Set 0 to disable polling.
-   * Only used when `flagsUrl` is set.
+   * Only used when `flagsUrl` is set (not `client`).
    */
   refreshInterval?: number;
   /** Custom fetch options (headers, credentials, etc.) */
@@ -102,6 +111,7 @@ function parseFlagData(
  * ```
  */
 export function RolleaseProvider({
+  client,
   initialFlags,
   flagsUrl,
   refreshInterval = 30_000,
@@ -110,6 +120,30 @@ export function RolleaseProvider({
   onError,
   children,
 }: RolleaseProviderProps) {
+  // ── Client-based mode ────────────────────────────────────────────────────
+  // When a RolleaseBrowserClient is supplied, delegate all state management
+  // to it.  This is the preferred pattern with rl.createHandler().
+
+  const applyClientDetails = React.useCallback(
+    (
+      details: Record<string, FlagResult>,
+      setFlags: React.Dispatch<React.SetStateAction<FlagMap>>,
+      setFlagDetails: React.Dispatch<React.SetStateAction<Record<string, FlagResult>>>,
+      setLastUpdatedAt: React.Dispatch<React.SetStateAction<Date | null>>
+    ) => {
+      const newFlags: FlagMap = {};
+      for (const [k, v] of Object.entries(details)) {
+        newFlags[k] = (v as FlagResult).value;
+      }
+      setFlags(newFlags);
+      setFlagDetails(details);
+      setLastUpdatedAt(new Date());
+    },
+    []
+  );
+
+  // ── Shared state ─────────────────────────────────────────────────────────
+
   // Parse initial flags (if provided synchronously)
   const initialParsed = React.useMemo(() => {
     if (!initialFlags) {
@@ -121,8 +155,7 @@ export function RolleaseProvider({
   const [flags, setFlags] = React.useState<FlagMap>(initialParsed.flags);
   const [flagDetails, setFlagDetails] = React.useState<Record<string, FlagResult>>(initialParsed.flagDetails);
   const [isLoading, setIsLoading] = React.useState<boolean>(
-    // Loading is true only when there's a flagsUrl AND no initialFlags
-    !!flagsUrl && !initialFlags
+    client ? true : (!!flagsUrl && !initialFlags)
   );
   const [isRefetching, setIsRefetching] = React.useState(false);
   const [error, setError] = React.useState<Error | null>(null);
@@ -130,7 +163,7 @@ export function RolleaseProvider({
     initialFlags ? new Date() : null
   );
 
-  // Stable refs for callbacks to avoid re-creating effects
+  // Stable refs for callbacks
   const onRefreshRef = React.useRef(onRefresh);
   onRefreshRef.current = onRefresh;
   const onErrorRef = React.useRef(onError);
@@ -138,22 +171,63 @@ export function RolleaseProvider({
   const fetchOptionsRef = React.useRef(fetchOptions);
   fetchOptionsRef.current = fetchOptions;
 
-  // Sync when initialFlags prop changes externally
+  // ── Client effect ─────────────────────────────────────────────────────────
   React.useEffect(() => {
+    if (!client) return;
+
+    // Sync immediately from whatever the client has cached
+    applyClientDetails(
+      client.flagDetails() as Record<string, FlagResult>,
+      setFlags, setFlagDetails, setLastUpdatedAt
+    );
+
+    // Wait for the client's first fetch to complete
+    let mounted = true;
+    client.ready().then(() => {
+      if (!mounted) return;
+      applyClientDetails(
+        client.flagDetails() as Record<string, FlagResult>,
+        setFlags, setFlagDetails, setLastUpdatedAt
+      );
+      setIsLoading(false);
+    }).catch((err: Error) => {
+      if (!mounted) return;
+      setError(err);
+      setIsLoading(false);
+      onErrorRef.current?.(err);
+    });
+
+    // Subscribe to subsequent changes (SSE / polling)
+    const unsub = client.onChange(() => {
+      if (!mounted) return;
+      applyClientDetails(
+        client.flagDetails() as Record<string, FlagResult>,
+        setFlags, setFlagDetails, setLastUpdatedAt
+      );
+      setIsRefetching(false);
+    });
+
+    return () => {
+      mounted = false;
+      unsub();
+    };
+  }, [client, applyClientDetails]);
+
+  // ── Sync initialFlags prop changes ────────────────────────────────────────
+  React.useEffect(() => {
+    if (client) return; // client takes priority
     setFlags(initialParsed.flags);
     setFlagDetails(initialParsed.flagDetails);
     if (initialFlags) {
       setLastUpdatedAt(new Date());
       setIsLoading(false);
     }
-  }, [initialParsed, initialFlags]);
+  }, [client, initialParsed, initialFlags]);
 
-  // Core fetch function
-  const fetchFlags = React.useCallback(
+  // ── URL-fetch mode ────────────────────────────────────────────────────────
+  const fetchFlagsFromUrl = React.useCallback(
     async (opts?: { isInitial?: boolean }) => {
-      if (!flagsUrl) return;
-
-      // Skip fetch when tab is not visible (only for background refreshes)
+      if (!flagsUrl || client) return;
       if (!opts?.isInitial && typeof document !== "undefined" && document.hidden) return;
 
       if (opts?.isInitial) {
@@ -169,56 +243,62 @@ export function RolleaseProvider({
         }
         const data = await res.json();
         const parsed = parseFlagData(data as Record<string, unknown>);
-
         setFlags(parsed.flags);
         setFlagDetails(parsed.flagDetails);
         setError(null);
         setLastUpdatedAt(new Date());
         onRefreshRef.current?.(parsed.flags);
       } catch (err) {
-        const error = err instanceof Error ? err : new Error(String(err));
-        setError(error);
-        onErrorRef.current?.(error);
+        const fetchErr = err instanceof Error ? err : new Error(String(err));
+        setError(fetchErr);
+        onErrorRef.current?.(fetchErr);
       } finally {
         setIsLoading(false);
         setIsRefetching(false);
       }
     },
-    [flagsUrl]
+    [flagsUrl, client]
   );
 
-  // Manual refetch (exposed via context)
   const refetch = React.useCallback(async () => {
-    await fetchFlags({ isInitial: false });
-  }, [fetchFlags]);
-
-  // Invalidate: clear all flags and force a fresh fetch
-  const invalidate = React.useCallback(async () => {
-    setFlags({});
-    setFlagDetails({});
-    setLastUpdatedAt(null);
-    await fetchFlags({ isInitial: true });
-  }, [fetchFlags]);
-
-  // Initial fetch on mount (when flagsUrl is set and no initialFlags)
-  React.useEffect(() => {
-    if (flagsUrl && !initialFlags) {
-      fetchFlags({ isInitial: true });
+    if (client) {
+      setIsRefetching(true);
+      await client.refetch();
+      // onChange listener above will update state
+    } else {
+      await fetchFlagsFromUrl({ isInitial: false });
     }
-    // Only run on mount
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [flagsUrl]);
+  }, [client, fetchFlagsFromUrl]);
 
-  // Polling effect
+  const invalidate = React.useCallback(async () => {
+    if (client) {
+      setFlags({});
+      setFlagDetails({});
+      setLastUpdatedAt(null);
+      setIsLoading(true);
+      await client.refetch();
+    } else {
+      setFlags({});
+      setFlagDetails({});
+      setLastUpdatedAt(null);
+      await fetchFlagsFromUrl({ isInitial: true });
+    }
+  }, [client, fetchFlagsFromUrl]);
+
+  // Initial fetch on mount (url mode only)
   React.useEffect(() => {
-    if (!flagsUrl || refreshInterval <= 0) return;
+    if (flagsUrl && !initialFlags && !client) {
+      fetchFlagsFromUrl({ isInitial: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [flagsUrl, client]);
 
-    const intervalId = setInterval(() => {
-      fetchFlags({ isInitial: false });
-    }, refreshInterval);
-
-    return () => clearInterval(intervalId);
-  }, [flagsUrl, refreshInterval, fetchFlags]);
+  // Polling (url mode only)
+  React.useEffect(() => {
+    if (!flagsUrl || client || refreshInterval <= 0) return;
+    const id = setInterval(() => fetchFlagsFromUrl({ isInitial: false }), refreshInterval);
+    return () => clearInterval(id);
+  }, [flagsUrl, client, refreshInterval, fetchFlagsFromUrl]);
 
   const value = React.useMemo<RolleaseContextValue>(
     () => ({

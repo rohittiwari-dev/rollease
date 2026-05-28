@@ -43,6 +43,83 @@ export interface RolleaseConfig {
   webhooks?: WebhookConfig[];
   /** Environment name — filters all flag operations to this environment */
   environment?: string;
+  /** Resilience: graceful degradation, retries, circuit breaker */
+  resilience?: ResilienceConfig;
+  /** Privacy: PII attribute scrubbing, data retention */
+  privacy?: PrivacyConfig;
+  /** OpenTelemetry / custom telemetry integration */
+  telemetry?: TelemetryAdapter;
+}
+
+export interface ResilienceConfig {
+  /**
+   * When true, DB errors during evaluate() return a fallback result
+   * ({ value: null, reason: 'error_fallback' }) instead of throwing.
+   * @default false
+   */
+  fallbackOnError?: boolean;
+  /** Retry configuration for DB operations. */
+  retry?: {
+    /** Max retry attempts. @default 3 */
+    attempts?: number;
+    /** Base delay between retries in ms. @default 100 */
+    backoffMs?: number;
+    /** Add random jitter to retry delay. @default true */
+    jitter?: boolean;
+  };
+  /**
+   * Simple circuit breaker: after `threshold` consecutive failures
+   * within `windowMs`, open the circuit and return fallback results
+   * for `resetAfterMs` before retrying.
+   */
+  circuitBreaker?: {
+    threshold?: number;
+    windowMs?: number;
+    resetAfterMs?: number;
+  };
+}
+
+export interface PrivacyConfig {
+  /**
+   * Context attribute keys to scrub before passing to impression tracking,
+   * audit history, and evaluation hooks. Values are replaced with '[REDACTED]'.
+   */
+  privateAttributes?: string[];
+  /** Automatically delete impression records older than N days. */
+  impressionRetentionDays?: number;
+  /** Automatically delete audit history older than N days. */
+  auditRetentionDays?: number;
+}
+
+/** Span object returned by TelemetryAdapter.startSpan(). */
+export interface TelemetrySpan {
+  setAttribute(key: string, value: string | number | boolean): void;
+  end(status?: "ok" | "error", error?: Error): void;
+}
+
+/**
+ * Plug-in telemetry adapter.  Use `createOtelAdapter(tracer)` from
+ * `rollease/telemetry` to integrate with `@opentelemetry/api`.
+ */
+export interface TelemetryAdapter {
+  startSpan(
+    name: string,
+    attrs?: Record<string, string | number | boolean>
+  ): TelemetrySpan;
+}
+
+/** Returned by `rl.health()` and `GET /api/rollease/health`. */
+export interface RolleaseHealthResult {
+  status: "healthy" | "degraded" | "unhealthy";
+  db: "ok" | "error";
+  cache: "ok" | "error" | "disabled";
+  latencyMs: number;
+  evalCount: number;
+  cacheHits: number;
+  cacheMisses: number;
+  cacheHitRate: number;
+  uptimeMs: number;
+  ts: number;
 }
 
 export interface ImpressionConfig {
@@ -348,6 +425,19 @@ export type EvalReason =
   | "weighted_random"
   | "default";
 
+export interface EvaluationTraceStep {
+  step: number;
+  name: string;
+  matched: boolean;
+  detail?: string;
+}
+
+export interface EvaluationTrace {
+  steps: EvaluationTraceStep[];
+  matchedRuleId?: string;
+  matchedVariantId?: string;
+}
+
 export interface FlagResult<T = unknown> {
   key: string;
   value: T;
@@ -356,6 +446,8 @@ export interface FlagResult<T = unknown> {
   reason: EvalReason;
   ruleId: string | null;
   evaluatedAt: Date;
+  /** Populated when evaluate() is called with { trace: true }. */
+  trace?: EvaluationTrace;
 }
 
 export type FlagMap = Record<string, unknown>;
@@ -677,9 +769,20 @@ export interface BulkUpdateResult {
 
 export interface WebhookConfig {
   url: string;
-  secret?: string; // HMAC signing secret
-  events?: HistoryAction[]; // Default: all
+  secret?: string;
+  events?: HistoryAction[];
   headers?: Record<string, string>;
+  /** Retry configuration. @default { attempts: 3, backoffMs: 500, jitter: true } */
+  retry?: {
+    attempts?: number;
+    backoffMs?: number;
+    jitter?: boolean;
+  };
+  /**
+   * Dead-letter queue sink: called with the payload and last error after all
+   * retries are exhausted.  Use to persist failed events to a queue or log.
+   */
+  dlq?: (payload: WebhookPayload, error: Error) => Promise<void> | void;
 }
 
 export interface WebhookPayload {

@@ -135,33 +135,66 @@ export class WebhookDispatcher {
       return;
     }
 
-    const controller =
-      typeof AbortController === "function" ? new AbortController() : undefined;
-    const timeout = controller
-      ? setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS)
-      : null;
+    const maxAttempts = config.retry?.attempts ?? 3;
+    const baseDelayMs = config.retry?.backoffMs ?? 500;
+    const useJitter = config.retry?.jitter ?? true;
+    let lastError: Error = new Error("Unknown webhook delivery error");
 
-    try {
-      const res = await fetch(config.url, {
-        method: "POST",
-        headers,
-        body,
-        signal: controller?.signal,
-      });
-      if (!res.ok) {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const controller =
+        typeof AbortController === "function" ? new AbortController() : undefined;
+      const timer = controller
+        ? setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS)
+        : null;
+
+      try {
+        const res = await fetch(config.url, {
+          method: "POST",
+          headers,
+          body,
+          signal: controller?.signal,
+        });
+        if (res.ok) return; // success — done
+        lastError = new Error(`HTTP ${res.status} ${res.statusText}`);
         this.logger.warn("webhook delivery non-2xx response", {
           url: config.url,
           status: res.status,
-          statusText: res.statusText,
+          attempt: attempt + 1,
+        });
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        this.logger.warn("webhook delivery attempt failed", {
+          url: config.url,
+          attempt: attempt + 1,
+          err: errMessage(err),
+        });
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+
+      if (attempt < maxAttempts - 1) {
+        const delay =
+          baseDelayMs * Math.pow(2, attempt) +
+          (useJitter ? Math.random() * baseDelayMs : 0);
+        await new Promise<void>((r) => setTimeout(r, delay));
+      }
+    }
+
+    // All attempts exhausted — send to DLQ if configured
+    this.logger.error("webhook delivery failed after all retries", {
+      url: config.url,
+      attempts: maxAttempts,
+      err: lastError.message,
+    });
+    if (config.dlq) {
+      try {
+        await config.dlq(payload, lastError);
+      } catch (dlqErr) {
+        this.logger.error("webhook DLQ sink threw", {
+          url: config.url,
+          err: errMessage(dlqErr),
         });
       }
-    } catch (err) {
-      this.logger.error("webhook delivery failed", {
-        url: config.url,
-        err: errMessage(err),
-      });
-    } finally {
-      if (timeout) clearTimeout(timeout);
     }
   }
 }

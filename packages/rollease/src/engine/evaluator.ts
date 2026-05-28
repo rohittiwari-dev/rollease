@@ -17,6 +17,7 @@ import type {
   RolloutConfig,
   EvalReason,
   ExclusionLayer,
+  EvaluationTraceStep,
 } from "../core/types";
 
 // ── Semver Utilities ───────────────────────────────────────────────────────
@@ -339,6 +340,11 @@ export interface EvaluateOptions {
    * directly so it stays safe in Edge runtimes and tests.
    */
   onWarning?: (message: string, meta?: Record<string, unknown>) => void;
+  /**
+   * When true, the returned FlagResult includes a `trace` field describing
+   * every pipeline step that was evaluated (matched or bypassed).
+   */
+  trace?: boolean;
 }
 
 /**
@@ -361,56 +367,87 @@ export function evaluateFlag<T = unknown>(
   options: EvaluateOptions = {}
 ): FlagResult<T> {
   const now = options.now || new Date();
+  const tracing = options.trace === true;
+  const steps: EvaluationTraceStep[] = [];
+
+  function pushStep(n: number, name: string, matched: boolean, detail?: string): void {
+    if (tracing) steps.push({ step: n, name, matched, detail });
+  }
+
+  function withTrace(result: FlagResult<T>): FlagResult<T> {
+    if (!tracing) return result;
+    return {
+      ...result,
+      trace: {
+        steps,
+        matchedRuleId: result.ruleId ?? undefined,
+        matchedVariantId: result.variant ?? undefined,
+      },
+    };
+  }
 
   // ── Step 2: Kill Switch ──────────────────────────────────────────────
   if (flag.status === "killed") {
-    return makeResult(flag, false, null, "kill_switch", null, now);
+    pushStep(2, "kill_switch", true);
+    return withTrace(makeResult(flag, false, null, "kill_switch", null, now));
   }
+  pushStep(2, "kill_switch", false);
 
   // ── Step 3: Disabled / Archived ──────────────────────────────────────
   if (flag.status === "archived") {
-    return makeResult(flag, flag.defaultValue, null, "disabled", null, now);
+    pushStep(3, "disabled", true);
+    return withTrace(makeResult(flag, flag.defaultValue, null, "disabled", null, now));
   }
+  pushStep(3, "disabled", false);
 
   // ── Step 4: Date Window ──────────────────────────────────────────────
   if (flag.scheduledAt) {
     const schedDate = new Date(flag.scheduledAt);
     if (schedDate.getTime() > now.getTime()) {
-      return makeResult(flag, flag.defaultValue, null, "not_scheduled", null, now);
+      pushStep(4, "date_window", true, `not_scheduled until ${flag.scheduledAt}`);
+      return withTrace(makeResult(flag, flag.defaultValue, null, "not_scheduled", null, now));
     }
   }
   if (flag.expiresAt) {
     const expDate = new Date(flag.expiresAt);
     if (expDate.getTime() < now.getTime()) {
-      return makeResult(flag, flag.defaultValue, null, "expired", null, now);
+      pushStep(4, "date_window", true, `expired at ${flag.expiresAt}`);
+      return withTrace(makeResult(flag, flag.defaultValue, null, "expired", null, now));
     }
   }
+  pushStep(4, "date_window", false);
 
   // ── Step 4.5: Prerequisites ─────────────────────────────────────
   if (flag.prerequisites && flag.prerequisites.length > 0 && options.prerequisiteResults) {
     for (const prereq of flag.prerequisites) {
       const prereqResult = options.prerequisiteResults[prereq.flagKey];
       if (!prereqResult || prereqResult.value !== prereq.variation) {
-        return makeResult(flag, flag.defaultValue, null, "prerequisite_not_met", null, now);
+        pushStep(5, "prerequisites", true, `prerequisite ${prereq.flagKey} not met`);
+        return withTrace(makeResult(flag, flag.defaultValue, null, "prerequisite_not_met", null, now));
       }
     }
   }
+  pushStep(5, "prerequisites", false);
 
   // ── Step 4.6: Exclusion Layers ──────────────────────────────────
   if (flag.exclusionLayer) {
     if (!options.exclusionLayer) {
-      return makeResult(flag, flag.defaultValue, null, "exclusion_layer_not_found", null, now);
+      pushStep(6, "exclusion_layer", true, "exclusion_layer_not_found");
+      return withTrace(makeResult(flag, flag.defaultValue, null, "exclusion_layer_not_found", null, now));
     }
     const userId = context.userId;
     if (!userId) {
-      return makeResult(flag, flag.defaultValue, null, "exclusion_group_miss", null, now);
+      pushStep(6, "exclusion_layer", true, "no userId for exclusion check");
+      return withTrace(makeResult(flag, flag.defaultValue, null, "exclusion_group_miss", null, now));
     }
     const bucket = getBucket(userId, options.exclusionLayer.key);
     const allocation = options.exclusionLayer.allocations.find((a) => a.flagKey === flag.key);
     if (!allocation || bucket < allocation.startBucket || bucket >= allocation.endBucket) {
-      return makeResult(flag, flag.defaultValue, null, "exclusion_group_miss", null, now);
+      pushStep(6, "exclusion_layer", true, `bucket ${bucket} outside allocation`);
+      return withTrace(makeResult(flag, flag.defaultValue, null, "exclusion_group_miss", null, now));
     }
   }
+  pushStep(6, "exclusion_layer", false);
 
   // ── Step 5: Local Override ───────────────────────────────────────────
   if (options.localOverride !== undefined) {
@@ -425,8 +462,10 @@ export function evaluateFlag<T = unknown>(
       }
     }
 
-    return makeResult<T>(flag, value, variant, "override", null, now);
+    pushStep(7, "local_override", true, `override value: ${String(options.localOverride)}`);
+    return withTrace(makeResult<T>(flag, value, variant, "override", null, now));
   }
+  pushStep(7, "local_override", false);
 
   // ── Step 6: Sticky Assignment ────────────────────────────────────────
   if (options.userAssignment) {
@@ -441,8 +480,10 @@ export function evaluateFlag<T = unknown>(
       }
     }
 
-    return makeResult(flag, value, variant, "assignment", null, now);
+    pushStep(8, "sticky_assignment", true, `assigned variant: ${options.userAssignment}`);
+    return withTrace(makeResult(flag, value, variant, "assignment", null, now));
   }
+  pushStep(8, "sticky_assignment", false);
 
   // ── Step 7: Targeting Rules ──────────────────────────────────────────
   const rules = [...(options.rules || [])].sort((a, b) => a.priority - b.priority);
@@ -451,36 +492,36 @@ export function evaluateFlag<T = unknown>(
     if (evaluateRule(rule, context, flag.key)) {
       // Holdout group — return default (control)
       if (rule.isHoldout) {
-        return makeResult(flag, flag.defaultValue, null, "rule_match", rule.id, now);
+        pushStep(9, "targeting_rules", true, `holdout rule ${rule.id}`);
+        return withTrace(makeResult(flag, flag.defaultValue, null, "rule_match", rule.id, now));
       }
 
       // Multivariate: resolve specific variant
       if (flag.type === "multivariate" && flag.variants && rule.variantId) {
         const variant = flag.variants.find((v) => v.id === rule.variantId);
         if (variant) {
-          return makeResult(flag, variant.value, variant.key, "rule_match", rule.id, now);
+          pushStep(9, "targeting_rules", true, `rule ${rule.id} → variant ${variant.key}`);
+          return withTrace(makeResult(flag, variant.value, variant.key, "rule_match", rule.id, now));
         }
         // Warn loudly — rule points at a variant that was renamed or deleted.
-        // Falling through to rule.value would silently swap the user into the
-        // wrong cohort. Bail with default + diagnostic.
         options.onWarning?.(
           "Rule references missing variantId — falling back to default value",
           { flagKey: flag.key, ruleId: rule.id, variantId: rule.variantId }
         );
-        return makeResult(flag, flag.defaultValue, null, "rule_match", rule.id, now);
+        pushStep(9, "targeting_rules", true, `rule ${rule.id} variantId missing, using default`);
+        return withTrace(makeResult(flag, flag.defaultValue, null, "rule_match", rule.id, now));
       }
 
       const ruleValue =
         flag.type === "boolean" ? (rule.value ?? true) : rule.value;
 
-      return makeResult(flag, ruleValue, null, "rule_match", rule.id, now);
+      pushStep(9, "targeting_rules", true, `rule ${rule.id} matched`);
+      return withTrace(makeResult(flag, ruleValue, null, "rule_match", rule.id, now));
     }
   }
+  pushStep(9, "targeting_rules", false, `${rules.length} rules checked, none matched`);
 
   // ── Step 8: Rollout / Multivariate Distribution ───────────────────────
-  // Single weighted-distribution path. For multivariate flags, weights drive
-  // the assignment. For boolean/string/number rollouts, the percentage gate
-  // decides on/off.
   const hashField = flag.rollout?.hashKey || "userId";
   const hashValue =
     ((context as Record<string, unknown>)[hashField] as string | undefined) ??
@@ -494,7 +535,8 @@ export function evaluateFlag<T = unknown>(
       for (const v of sorted) {
         cumWeight += v.weight;
         if (bucket < cumWeight) {
-          return makeResult(flag, v.value, v.key, "weighted_random", null, now);
+          pushStep(10, "rollout", true, `weighted_random bucket ${bucket} → variant ${v.key}`);
+          return withTrace(makeResult(flag, v.value, v.key, "weighted_random", null, now));
         }
       }
     }
@@ -503,19 +545,22 @@ export function evaluateFlag<T = unknown>(
     const bucket = getBucket(hashValue, flag.key);
     if (bucket < effectivePct) {
       const value = flag.type === "boolean" ? true : flag.defaultValue;
-      return makeResult(flag, value, null, "percentage", null, now);
+      pushStep(10, "rollout", true, `percentage ${effectivePct}%, bucket ${bucket}`);
+      return withTrace(makeResult(flag, value, null, "percentage", null, now));
     }
   }
+  pushStep(10, "rollout", false);
 
   // ── Step 9: Default ────────────────────────────────────────────
-  // Check per-environment defaults before the global default
   if (flag.environmentDefaults && context.environment) {
     const envDefault = flag.environmentDefaults[context.environment];
     if (envDefault !== undefined) {
-      return makeResult(flag, envDefault, null, "default", null, now);
+      pushStep(11, "default", true, `env default for ${context.environment}`);
+      return withTrace(makeResult(flag, envDefault, null, "default", null, now));
     }
   }
-  return makeResult(flag, flag.defaultValue, null, "default", null, now);
+  pushStep(11, "default", true, "global default");
+  return withTrace(makeResult(flag, flag.defaultValue, null, "default", null, now));
 }
 
 // ── Result Constructor ─────────────────────────────────────────────────────

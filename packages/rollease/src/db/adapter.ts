@@ -210,6 +210,25 @@ export interface DbAdapter {
   /** Update the lastEvaluatedAt timestamp for a flag (fire-and-forget). */
   touchFlagEvaluation?(key: string): Promise<void>;
 
+  // ── GDPR / Compliance ────────────────────────────────────────────────
+
+  /**
+   * Delete all personal data for a user (GDPR right-to-erasure).
+   * Scope defaults to all data types when omitted.
+   */
+  forgetUser?(
+    userId: string,
+    scope?: Array<"impressions" | "assignments" | "history">
+  ): Promise<void>;
+
+  // ── Scheduled Releases ───────────────────────────────────────────────
+
+  /**
+   * Return releases whose scheduledAt <= now and status is 'pending' or
+   * 'scheduled'.  Used by rl.flags.runScheduledReleases().
+   */
+  listScheduledReleases?(): Promise<Release[]>;
+
   // ── Lifecycle ────────────────────────────────────────────────────────
 
   /** Close any active database connections. */

@@ -461,4 +461,147 @@ describe("Flag Evaluation Engine", () => {
       expect(r1.reason).toBe("weighted_random");
     });
   });
+
+  describe("Evaluation trace", () => {
+    it("trace is absent when not requested", () => {
+      const res = evaluateFlag(baseFlag, {});
+      expect(res.trace).toBeUndefined();
+    });
+
+    it("trace is present and has steps when trace: true", () => {
+      const res = evaluateFlag(baseFlag, {}, { trace: true });
+      expect(res.trace).toBeDefined();
+      expect(Array.isArray(res.trace!.steps)).toBe(true);
+      expect(res.trace!.steps.length).toBeGreaterThan(0);
+    });
+
+    it("kill_switch: step 2 matched=true, only 1 step recorded", () => {
+      const flag = { ...baseFlag, status: "killed" as const };
+      const res = evaluateFlag(flag, {}, { trace: true });
+      expect(res.reason).toBe("kill_switch");
+      expect(res.trace!.steps).toHaveLength(1);
+      expect(res.trace!.steps[0]).toMatchObject({ step: 2, name: "kill_switch", matched: true });
+    });
+
+    it("disabled: steps 2 (false) + 3 (true)", () => {
+      const flag = { ...baseFlag, status: "archived" as const };
+      const res = evaluateFlag(flag, {}, { trace: true });
+      expect(res.reason).toBe("disabled");
+      expect(res.trace!.steps[0]).toMatchObject({ step: 2, matched: false });
+      expect(res.trace!.steps[1]).toMatchObject({ step: 3, name: "disabled", matched: true });
+    });
+
+    it("not_scheduled: step 4 matched=true with detail", () => {
+      const flag = { ...baseFlag, scheduledAt: new Date(Date.now() + 10_000).toISOString() };
+      const res = evaluateFlag(flag, {}, { trace: true });
+      expect(res.reason).toBe("not_scheduled");
+      const step4 = res.trace!.steps.find((s) => s.step === 4);
+      expect(step4).toMatchObject({ matched: true, name: "date_window" });
+      expect(step4!.detail).toMatch(/not_scheduled/);
+    });
+
+    it("local_override: step 7 matched=true with override detail", () => {
+      const res = evaluateFlag(baseFlag, {}, { trace: true, localOverride: true });
+      expect(res.reason).toBe("override");
+      const step7 = res.trace!.steps.find((s) => s.name === "local_override");
+      expect(step7).toMatchObject({ matched: true });
+      expect(step7!.detail).toMatch(/override value/);
+    });
+
+    it("sticky_assignment: step 8 matched=true", () => {
+      const res = evaluateFlag(baseFlag, {}, { trace: true, userAssignment: "treatment" });
+      expect(res.reason).toBe("assignment");
+      const step8 = res.trace!.steps.find((s) => s.name === "sticky_assignment");
+      expect(step8).toMatchObject({ matched: true });
+    });
+
+    it("targeting_rules: step 9 matched=true records ruleId", () => {
+      const rule: FlagRule = {
+        id: "r1",
+        flagKey: baseFlag.key,
+        priority: 1,
+        value: true,
+        enabled: true,
+        conditions: { any: [{ dimension: "userId", op: "eq", value: "alice" }] },
+      };
+      const res = evaluateFlag(baseFlag, { userId: "alice" }, { trace: true, rules: [rule] });
+      expect(res.reason).toBe("rule_match");
+      const step9 = res.trace!.steps.find((s) => s.name === "targeting_rules");
+      expect(step9).toMatchObject({ matched: true });
+      expect(res.trace!.matchedRuleId).toBe("r1");
+    });
+
+    it("targeting_rules: no match, step 9 matched=false with checked count in detail", () => {
+      const rule: FlagRule = {
+        id: "r-miss",
+        flagKey: baseFlag.key,
+        priority: 1,
+        value: true,
+        enabled: true,
+        conditions: { any: [{ dimension: "userId", op: "eq", value: "bob" }] },
+      };
+      const res = evaluateFlag(baseFlag, { userId: "alice" }, { trace: true, rules: [rule] });
+      const step9 = res.trace!.steps.find((s) => s.name === "targeting_rules");
+      expect(step9).toMatchObject({ matched: false });
+      expect(step9!.detail).toMatch(/1 rule/);
+    });
+
+    it("percentage rollout: step 10 matched=true with bucket detail", () => {
+      // 100% rollout guarantees entry
+      const flag: Flag = {
+        ...baseFlag,
+        rollout: { percentage: 100, sticky: true, hashKey: "userId" },
+      };
+      const res = evaluateFlag(flag, { userId: "user-abc" }, { trace: true });
+      expect(res.reason).toBe("percentage");
+      const step10 = res.trace!.steps.find((s) => s.step === 10);
+      expect(step10).toMatchObject({ matched: true, name: "rollout" });
+    });
+
+    it("default: all steps pass through, last step matched=true", () => {
+      const res = evaluateFlag(baseFlag, { userId: "nobody" }, { trace: true });
+      expect(res.reason).toBe("default");
+      const lastStep = res.trace!.steps[res.trace!.steps.length - 1];
+      expect(lastStep).toMatchObject({ matched: true, name: "default" });
+      // Verify all prior steps were not matched (they were bypassed)
+      const priorSteps = res.trace!.steps.slice(0, -1);
+      expect(priorSteps.every((s) => !s.matched)).toBe(true);
+    });
+
+    it("trace includes matchedVariantId for rule_match with variant", () => {
+      const flag: Flag = {
+        ...baseFlag,
+        type: "multivariate",
+        variants: [{ id: "v1", key: "treatment", value: "T", weight: 100 }],
+      };
+      const rule: FlagRule = {
+        id: "r-variant",
+        flagKey: flag.key,
+        priority: 1,
+        value: "T",
+        enabled: true,
+        conditions: { any: [{ dimension: "userId", op: "eq", value: "alice" }] },
+        variantId: "v1",
+      };
+      const res = evaluateFlag(flag, { userId: "alice" }, { trace: true, rules: [rule] });
+      expect(res.reason).toBe("rule_match");
+      expect(res.trace!.matchedVariantId).toBe("treatment");
+      expect(res.trace!.matchedRuleId).toBe("r-variant");
+    });
+
+    it("weighted_random: step 10 matched=true, matchedVariantId set", () => {
+      const flag: Flag = {
+        ...baseFlag,
+        type: "multivariate",
+        variants: [
+          { id: "v1", key: "control", value: "A", weight: 100 },
+        ],
+      };
+      const res = evaluateFlag(flag, { userId: "u-test" }, { trace: true });
+      expect(res.reason).toBe("weighted_random");
+      expect(res.trace!.matchedVariantId).toBe("control");
+      const step10 = res.trace!.steps.find((s) => s.step === 10);
+      expect(step10).toMatchObject({ matched: true, name: "rollout" });
+    });
+  });
 });

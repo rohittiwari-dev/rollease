@@ -893,6 +893,51 @@ export class MemoryDbAdapter implements DbAdapter {
       this.flags.set(key, flag);
     }
   }
+
+  // ── GDPR / Compliance ─────────────────────────────────────────────────
+
+  async forgetUser(
+    userId: string,
+    scope?: Array<"impressions" | "assignments" | "history">
+  ): Promise<void> {
+    const all = !scope || scope.length === 0;
+
+    if (all || scope!.includes("assignments")) {
+      for (const key of this.assignments.keys()) {
+        if (key.endsWith(`:${userId}`)) {
+          this.assignments.delete(key);
+        }
+      }
+    }
+
+    if (all || scope!.includes("impressions")) {
+      this.impressions = this.impressions.filter(
+        (imp) => imp["userId"] !== userId
+      );
+    }
+
+    if (all || scope!.includes("history")) {
+      this.history = this.history.filter((entry) => {
+        const by = entry.by;
+        if (typeof by === "string") return by !== userId;
+        if (by && typeof by === "object") {
+          return (by as { id?: string }).id !== userId;
+        }
+        return true;
+      });
+    }
+  }
+
+  // ── Scheduled Releases ────────────────────────────────────────────────
+
+  async listScheduledReleases(): Promise<import("../core/types").Release[]> {
+    const now = new Date();
+    return Array.from(this.releases.values()).filter((r) => {
+      if (r.status !== "pending" && r.status !== "scheduled") return false;
+      if (!r.scheduledAt) return false;
+      return new Date(r.scheduledAt) <= now;
+    });
+  }
 }
 
 /**

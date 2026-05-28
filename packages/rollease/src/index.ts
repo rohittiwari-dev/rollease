@@ -8,8 +8,10 @@ import { RedisCacheAdapter } from "./db/redis";
 import { ValidationError } from "./core/errors";
 import { createLogger } from "./core/logger";
 import { INTERNAL_SECRET } from "./core/internal";
-import type { RolleaseConfig } from "./core/types";
+import { createRolleaseHandler } from "./handler";
+import type { RolleaseConfig, RolleaseHealthResult } from "./core/types";
 import type { CacheAdapter } from "./db/adapter";
+import type { RolleaseHandlerOptions, RolleaseHandler } from "./handler";
 
 // ── Core Types ─────────────────────────────────────────────────────────────
 export type {
@@ -103,6 +105,13 @@ export type {
   // GeoIP
   GeoContext,
   GeoIPAdapter,
+
+  // Resilience, Privacy, Telemetry
+  ResilienceConfig,
+  PrivacyConfig,
+  TelemetryAdapter,
+  TelemetrySpan,
+  RolleaseHealthResult,
 } from "./core/types";
 
 // ── Errors ─────────────────────────────────────────────────────────────────
@@ -122,6 +131,13 @@ export {
 // ── Engine ─────────────────────────────────────────────────────────────────
 export { evaluateFlag, evaluateConditionGroup } from "./engine/evaluator";
 export { FlagManager } from "./engine/manager";
+
+// ── Handler ─────────────────────────────────────────────────────────────────
+export { createRolleaseHandler } from "./handler";
+export type { RolleaseHandlerOptions, RolleaseHandler } from "./handler";
+
+// ── Telemetry ─────────────────────────────────────────────────────────────
+export { createOtelAdapter, createConsoleAdapter, noopSpan } from "./core/telemetry";
 
 // ── Utilities ──────────────────────────────────────────────────────────────
 export { getBucket, murmurhash3_32 } from "./bucket";
@@ -194,6 +210,38 @@ export type {
 
 export interface RolleaseClient {
   flags: FlagManager;
+
+  /** Check SDK health — DB connectivity, cache status, and evaluation metrics. */
+  health(): Promise<RolleaseHealthResult>;
+
+  /**
+   * Create a fetch-compatible HTTP handler that exposes Rollease evaluation
+   * and management routes.  Mount it at a single catch-all route in your
+   * framework of choice.
+   *
+   * **Next.js App Router** — `app/api/rollease/[...path]/route.ts`:
+   * ```ts
+   * import { rl } from '@/lib/rollease'
+   *
+   * const handler = rl.createHandler({
+   *   contextFromRequest: async (req) => ({ userId: await getServerUserId(req) }),
+   *   adminAuth: async (req) => req.headers.get('x-admin-token') === process.env.ADMIN_TOKEN,
+   * })
+   *
+   * export const GET  = handler
+   * export const POST = handler
+   * export const PATCH  = handler
+   * export const DELETE = handler
+   * ```
+   *
+   * **Hono / Bun.serve**:
+   * ```ts
+   * const handler = rl.createHandler({ contextFromRequest: ... })
+   * app.all('/api/rollease/*', (c) => handler(c.req.raw))
+   * ```
+   */
+  createHandler(options?: RolleaseHandlerOptions): RolleaseHandler;
+
   /**
    * @deprecated Read via `client[Symbol.for('rollease.internal.secret')]()` if
    * absolutely necessary. This object remains present for one release to keep
@@ -262,6 +310,9 @@ export function createRollease(config: RolleaseConfig): RolleaseClient {
     autoResolveSegments: config.autoResolveSegments,
     webhooks: config.webhooks,
     environment: config.environment,
+    resilience: config.resilience,
+    privacy: config.privacy,
+    telemetry: config.telemetry,
   });
 
   // Capture the secret in a closure so it never appears on the public client
@@ -270,6 +321,12 @@ export function createRollease(config: RolleaseConfig): RolleaseClient {
 
   const client: RolleaseClient = {
     flags,
+    async health() {
+      return flags.health();
+    },
+    createHandler(options?: RolleaseHandlerOptions): RolleaseHandler {
+      return createRolleaseHandler(flags, options);
+    },
     async close() {
       if (config.db.close) {
         await config.db.close();
