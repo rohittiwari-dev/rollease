@@ -40,6 +40,9 @@ export default defineConfig({
     "core/metrics": "src/core/metrics.ts",
     "core/rbac": "src/core/rbac.ts",
     "core/openapi": "src/core/openapi.ts",
+    "core/exposure": "src/core/exposure.ts",
+    "core/tenant": "src/core/tenant.ts",
+    "core/replica": "src/core/replica.ts",
     telemetry: "src/core/telemetry.ts",
 
     // Engine

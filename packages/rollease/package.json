@@ -207,6 +207,21 @@
       "import": "./dist/core/openapi.mjs",
       "require": "./dist/core/openapi.js"
     },
+    "./core/exposure": {
+      "types": "./dist/core/exposure.d.ts",
+      "import": "./dist/core/exposure.mjs",
+      "require": "./dist/core/exposure.js"
+    },
+    "./core/tenant": {
+      "types": "./dist/core/tenant.d.ts",
+      "import": "./dist/core/tenant.mjs",
+      "require": "./dist/core/tenant.js"
+    },
+    "./core/replica": {
+      "types": "./dist/core/replica.d.ts",
+      "import": "./dist/core/replica.mjs",
+      "require": "./dist/core/replica.js"
+    },
     "./engine/evaluator": {
       "types": "./dist/engine/evaluator.d.ts",
       "import": "./dist/engine/evaluator.mjs",
