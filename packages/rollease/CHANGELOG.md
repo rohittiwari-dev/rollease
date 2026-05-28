@@ -6,6 +6,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed (Phase 4-6 audit — 2026-05-28)
+
+#### RBAC & Permissions
+- `createRelease` now fires `"release.created"` mutation hook action (was incorrectly `"release.deployed"`). Editors with `release.create` permission can now create releases.
+- Added `"release.reject"` to `RolleasePermission`. Editor and admin roles include it; viewer does not.
+- `"release.rejected"` → `"release.reject"` added to `ACTION_PERMISSION_MAP`. `rejectRelease` is now RBAC-gated (previously unrestricted).
+- `createRBACAdminAuth` now requires `flag.create` minimum (was `flag.read` — viewers passed the admin gate).
+- `"release.created"` added to `HistoryAction` union.
+
+#### Privacy & Attributes
+- `scrubContext()` now redacts top-level `FlagContext` fields (`userId`, `region`, `tenantId`, `ip`, etc.) in addition to `ctx.attributes`. Listing `"userId"` in `privacy.privateAttributes` now correctly redacts `ctx.userId`.
+- `onBeforeEvaluation` hook receives the scrubbed context — PII no longer leaks into hook handlers.
+
+#### Features Management
+- `MetricsAdapter` wired into `FlagManager`. Add `metrics?: MetricsAdapter` to `RolleaseConfig`; SDK emits `rollease_evaluations_total`, cache hits/misses, errors, impressions, and evaluation latency automatically.
+- `FlagManager.getMetrics()` returns Prometheus text format. Handler now exposes `GET /metrics` (admin-gated).
+- `impressions.dedupe?: { windowMs, maxEntries, keyFields }` in `ImpressionConfig`. When set, `createExposureTracker` is wired into manager impression tracking — duplicate impressions within the window are suppressed.
+- `evaluateAllDetailed` now accepts `{ trace: true }` option for bulk evaluation traces.
+- Single-flag `evaluate()` now enforces `flag.environments[]` filter, matching `evaluateAll/evaluateAllDetailed`. Production-scoped flags return `missingFlagResult` when evaluated in wrong environments.
+- `dbReader?: DbAdapter` added to `RolleaseConfig` for read-replica routing at the SDK level.
+
+#### Multi-Tenancy Adapter
+- `createTenantAdapter` forwards 5 previously-missing optional `DbAdapter` methods: `getUserAssignments` (with key namespacing/un-namespacing), `touchFlagEvaluation`, `listScheduledReleases`, `approveRelease`, `rejectRelease`.
+
+#### HTTP Handler
+- `extractActor?: (req) => AuditActor | undefined` option added to `RolleaseHandlerOptions`. Actor is passed to all manager write calls; RBAC hooks now see the HTTP caller.
+- `healthAuth?: (req) => boolean` option — when set, `GET /health` requires auth.
+- New routes: `GET /metrics`, `GET /admin/flags/:key`, `GET/POST /admin/flags/:key/rules`, `PATCH/DELETE /admin/flags/:key/rules/:ruleId`, `POST /admin/flags/:key/rollout`, `POST /admin/flags/:key/lock`, `GET/POST /admin/releases`, `POST /admin/releases/:id/deploy`, `POST /admin/releases/:id/rollback`, `POST /admin/releases/:id/approve`, `POST /admin/releases/:id/reject`, `PATCH/DELETE /admin/segments/:key`.
+- Internal error details no longer leak to clients. Validation errors surface their messages; all others return `"Internal server error"` and log internally.
+
+#### Exports
+- New exports: `PrometheusAdapter`, `createPrometheusAdapter`, `noopMetrics`, `MetricsAdapter` (type), `createExposureTracker`, `ExposureTracker`/`ExposureTrackerConfig`/`ExposureStats` (types), `createDefaultRBACPolicy`, `createRBACHook`, `createRBACAdminAuth`, `RolleaseRole`/`RolleasePermission`/`RolleaseRBACPolicy` (types), `createTenantAdapter`, `TenantAdapterConfig` (type).
+
 ### Added
 
 #### Universal HTTP Handler

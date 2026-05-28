@@ -162,6 +162,38 @@ export type {
 // ── Telemetry ─────────────────────────────────────────────────────────────
 export { createOtelAdapter, createConsoleAdapter, noopSpan } from "./core/telemetry";
 
+// ── Metrics ────────────────────────────────────────────────────────────────
+export {
+  PrometheusAdapter,
+  createPrometheusAdapter,
+  noopMetrics,
+} from "./core/metrics";
+export type { MetricsAdapter } from "./core/metrics";
+
+// ── Exposure Dedup ─────────────────────────────────────────────────────────
+export { createExposureTracker } from "./core/exposure";
+export type {
+  ExposureTracker,
+  ExposureTrackerConfig,
+  ExposureStats,
+} from "./core/exposure";
+
+// ── RBAC ───────────────────────────────────────────────────────────────────
+export {
+  createDefaultRBACPolicy,
+  createRBACHook,
+  createRBACAdminAuth,
+} from "./core/rbac";
+export type {
+  RolleaseRole,
+  RolleasePermission,
+  RolleaseRBACPolicy,
+} from "./core/rbac";
+
+// ── Multi-Tenancy ──────────────────────────────────────────────────────────
+export { createTenantAdapter } from "./core/tenant";
+export type { TenantAdapterConfig } from "./core/tenant";
+
 // ── Utilities ──────────────────────────────────────────────────────────────
 export { getBucket, murmurhash3_32 } from "./bucket";
 export { loadLocalOverrides } from "./overrides";
@@ -353,6 +385,8 @@ export function createRollease(config: RolleaseConfig): RolleaseClient {
     privacy: config.privacy,
     telemetry: config.telemetry,
     invalidationBus: config.invalidation,
+    metrics: config.metrics,
+    dbReader: config.dbReader,
   });
 
   // Capture the secret in a closure so it never appears on the public client

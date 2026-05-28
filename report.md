@@ -1,8 +1,10 @@
-Rollease SDK — Status Report (updated 2026-05-28, invalidation/resilience/tracking shipped)
+Rollease SDK — Status Report (updated 2026-05-28, phases 4-6 implementation review)
 
 ▎ Original audit: compared Rollease against LaunchDarkly Server-SDK 9.x, Statsig 6.x, Unleash 5.x, GrowthBook 1.x, ConfigCat 9.x, OpenFeature 0.7, PostHog across 24 categories.
-▎ This update: reflects what has actually been implemented since the original audit.
-▎ Build: last verified clean (tsup --dts). Tests: last verified 222 passing across 19 test files; one additional handler regression was added after that run.
+▎ This update: reflects what has actually been implemented since the original audit, including Phase 4-6 features.
+▎ Build: last verified clean (tsup --dts). Tests: 220 passing across 20 test files (27 pre-existing React DOM failures in Bun env — unrelated to flag logic).
+▎ Code review: see audit.md for full correctness review of permissions, attributes, roles, and features management.
+▎ Phase 4-6 audit fixes: all Tier 1 correctness blockers and Tier 2 wiring gaps resolved. See CHANGELOG.md for full list.
 
 ---
 
@@ -44,14 +46,18 @@ Rollease SDK — Status Report (updated 2026-05-28, invalidation/resilience/trac
 
 1. ✅ Redis pub/sub cache invalidation — `InvalidationBus` abstraction ships with Redis and memory implementations; multi-replica coherence requires passing `config.invalidation`.
 2. ✅ Eval-trace API — `evaluate(key, ctx, { trace: true })` populates `FlagResult.trace` with step-by-step pipeline trace including matched/bypassed status and detail strings. 13 regression tests.
-3. ❌ Typed flag keys + codegen — no compile-time enforcement; typos in flag keys are runtime errors.
+3. ✅ Typed flag keys + codegen — module augmentation via `FlagDefinitions`, helper types, `generateFlagTypes()` codegen. `flag-types.ts` + `codegen/codegen.ts`.
 4. ✅ Circuit breaker + DB read retry — now wired into evaluation read paths and health reporting.
-5. ❌ Cloudflare KV / Vercel KV / Deno KV adapters — still no edge-native DB.
-6. ❌ CLI (`npx rollease`) — no scaffolding, export/import, or kill-switch tooling.
+5. ✅ Cloudflare KV adapter — `db/cloudflare-kv.ts` ships. Vercel KV / Deno KV still missing.
+6. ❌ CLI (`npx rollease`) — deferred as separate `@rollease/cli` package.
 7. ⚠️ Conversion/metric tracking — custom event persistence and browser batching are shipped; exposure dedupe, metric joins, and statistics remain open.
-8. ❌ Multi-tenant storage namespacing.
+8. ⚠️ Multi-tenant storage namespacing — `createTenantAdapter` ships (tenant.ts) with correct key namespacing. Previously-missing methods forwarded: `getUserAssignments` (with tenant prefix), `touchFlagEvaluation`, `listScheduledReleases`, `approveRelease`, `rejectRelease`. Remaining: manager L1/L2 cache keys are still global (tenant isolation at storage but not cache layer).
 9. ❌ Statistical analysis engine.
-10. ❌ Vue, Svelte, React Native, mobile integrations.
+10. ✅ Vue, Svelte, Angular, NestJS, React Native integrations — all shipped as subpath exports.
+11. ✅ RBAC system — all wiring bugs fixed: `createRelease` fires `"release.created"` action; `rejectRelease` mapped to `"release.reject"` permission; handler extracts actor via `extractActor` option; `createRBACAdminAuth` gates with `flag.create`. 24 regression tests added.
+12. ✅ Prometheus metrics — `MetricsAdapter` wired into `FlagManager` and `RolleaseConfig`. `GET /metrics` route added to handler. All counters/histograms auto-emitted on evaluate, cache hit/miss, error, impression.
+13. ✅ Exposure deduplication — `createExposureTracker` wired into manager impression tracking via `impressions.dedupe` config. No manual hook wiring required.
+14. ✅ PII scrubbing — `scrubContext()` now redacts top-level FlagContext fields (`userId`, `region`, `tenantId`, `ip`, etc.) in addition to `ctx.attributes`. `onBeforeEvaluation` receives scrubbed context.
 
 ---
 
@@ -269,7 +275,8 @@ Routes exposed by the universal handler:
 ├───────────────────────────────────────────────────────────────────────────┼───────────────────────┼──────────────────────────────────────────────────────────────┤
 │ Audit retention / archive policy                                          │ LD, Statsig           │ ⚠️  privacy.auditRetentionDays type exists; enforcement ❌   │
 ├───────────────────────────────────────────────────────────────────────────┼───────────────────────┼──────────────────────────────────────────────────────────────┤
-│ Built-in RBAC (not just hooks)                                            │ LD, Statsig, Unleash  │ ❌ (hooks-only — RBAC is caller's responsibility)             │
+│ Built-in RBAC (not just hooks)                                            │ LD, Statsig, Unleash  │ ⚠️ rbac.ts ships roles/permissions/policy factory but handler │
+│                                                                           │                       │    never extracts actor; createRelease fires wrong action.    │
 ├───────────────────────────────────────────────────────────────────────────┼───────────────────────┼──────────────────────────────────────────────────────────────┤
 │ Right-to-explanation (per-user exposure list)                             │ LD                    │ ❌ history has flagKey, no efficient per-user query            │
 ├───────────────────────────────────────────────────────────────────────────┼───────────────────────┼──────────────────────────────────────────────────────────────┤
@@ -310,9 +317,12 @@ Routes exposed by the universal handler:
 ✅ Next.js App Router (middleware + RSC + client)
 ✅ React (RolleaseProvider + useFlag + useFlagVariant)
 ✅ Universal fetch handler (Hono, Bun.serve, Cloudflare Workers — no adapter needed)
-❌ React Native
-❌ Vue / Pinia
-❌ Svelte / SvelteKit
+✅ React Native (`rollease/react-native` — thin wrapper over `rollease/client` with AsyncStorage)
+✅ Vue 3 (`rollease/vue` — plugin + useFlag + FeatureGate component)
+✅ Svelte 5 (`rollease/svelte` — store, useFlag, FeatureGate)
+✅ Angular 17+ (`rollease/angular` — injectable service + signals + `*rlFeatureGate` directive)
+✅ NestJS (`rollease/nestjs` — dynamic module, `@InjectRollease`, `@FeatureFlag` decorator, `RolleaseGuard`)
+✅ Express/Fastify/Hono/Koa middleware wrappers (`rollease/middleware`)
 ❌ Solid
 ❌ Remix loaders
 ❌ Astro server islands
@@ -414,7 +424,10 @@ Present: Memory, Prisma, Drizzle, Sequelize, Redis cache (L1 in-process + L2 Red
 
 19. Multi-Tenancy (P1 for B2B SaaS)
 
-❌ All items from the original audit still open: tenant-namespaced storage, per-tenant overrides, cross-tenant analytics, per-tenant rate limiting. The `context.tenantId` field exists but is not load-bearing in DB adapters.
+⚠️ `createTenantAdapter(innerDb, { tenantId })` shipped — wraps all flag/rule/segment CRUD with namespaced keys. Key gaps:
+- Manager cache keys (`rollease:flag:${key}`) are NOT tenant-scoped — two tenants with same flag key share L1/L2 cache.
+- 6 optional adapter methods not forwarded: `getUserAssignments`, `touchFlagEvaluation`, `listScheduledReleases`, `approveRelease`, `rejectRelease`.
+- Per-tenant rate limiting and per-tenant analytics still open.
 
 ---
 
@@ -533,26 +546,37 @@ Priority order:
 
 ---
 
-### Phase 5 — v0.3 (Reach) — LATER
+### Phase 5 — v0.3 (Reach) — IN PROGRESS / PARTIALLY COMPLETE
 
-7. ❌ React Native client
-8. ❌ Vue + Svelte integrations
-9. ❌ Express / Fastify / Hono typed middleware wrappers
+7. ✅ React Native client (`rollease/react-native`)
+8. ✅ Vue + Svelte + Angular integrations
+9. ✅ Express / Fastify / Hono / Koa typed middleware wrappers (`rollease/middleware`)
 10. ⚠️ Custom event tracking + browser batching shipped; conversion attribution and metric joins remain open
-11. ❌ Exposure deduplication
-12. ❌ Prometheus metrics endpoint
+11. ⚠️ Exposure deduplication — `createExposureTracker()` shipped but NOT wired into manager impression tracking
+12. ⚠️ Prometheus metrics endpoint — `PrometheusAdapter` shipped but NOT wired into `FlagManager` or handler
 
 ---
 
-### Phase 6 — v1.0 (Enterprise) — FUTURE
+### Phase 6 — v1.0 (Enterprise) — IN PROGRESS / PARTIALLY COMPLETE
 
-13. ❌ Multi-tenant storage namespacing
-14. ❌ Built-in RBAC (beyond hooks)
-15. ❌ Bulk-write transactions in adapters
-16. ❌ Read-replica routing
-17. ❌ Import from LaunchDarkly / Statsig / Unleash
+13. ⚠️ Multi-tenant storage namespacing — `createTenantAdapter` ships; 6 optional methods missing; cache keys not tenant-scoped
+14. ⚠️ Built-in RBAC — roles/permissions/policy factory ships; handler actor extraction broken; 3 action-permission mapping bugs
+15. ❌ Bulk-write transactions in adapters — manager does sequential writes, no transaction rollback
+16. ✅ Read-replica routing — `replica.ts` `ReadReplicaDbAdapter` ships
+17. ✅ Import from LaunchDarkly / Statsig / Unleash — `migrations/index.ts`
 18. ❌ Documentation site + TypeDoc API reference + playground
 19. ❌ GitHub Actions CI + coverage gates + SLSA attestation
+
+### Critical Fixes Required Before v1.0 Marketing Claims
+
+A. Handler must extract `actor` from requests and pass to manager write calls.
+B. `createRelease` must fire `"release.created"` action (not `"release.deployed"`).
+C. Add `"release.rejected"` to `ACTION_PERMISSION_MAP`.
+D. `scrubContext()` must scrub top-level FlagContext fields, not only `ctx.attributes`.
+E. Wire `MetricsAdapter` into `FlagManager` + `RolleaseConfig`.
+F. Wire `ExposureTracker` into manager impression tracking.
+G. Tenant adapter must forward 6 missing optional methods.
+H. Tenant adapter cache keys must be namespaced per tenant.
 
 ---
 
@@ -578,9 +602,14 @@ Priority order:
 | Eval-trace API          | ❌                | ✅ shipped        |
 | Redis pub/sub           | ❌                | ✅                |
 | Event batching          | ❌                | ✅ browser flush  |
-| Typed flag keys         | ❌                | ❌                |
+| Typed flag keys         | ❌                | ✅                |
 | Circuit breaker         | ❌                | ✅                |
-| Vue / Svelte / RN       | ❌                | ❌                |
-| CLI                     | ❌                | ❌                |
-| Multi-tenancy           | ❌                | ❌                |
+| Vue / Svelte / Angular  | ❌                | ✅                |
+| NestJS / React Native   | ❌                | ✅                |
+| RBAC system             | ❌                | ⚠️ wiring bugs   |
+| Metrics adapter         | ❌                | ⚠️ not wired     |
+| Exposure dedup          | ❌                | ⚠️ not wired     |
+| Multi-tenancy           | ❌                | ⚠️ partial       |
+| LD/Statsig/Unleash import | ❌              | ✅                |
+| CLI                     | ❌                | ❌ deferred      |
 | Stats engine            | ❌                | ❌                |

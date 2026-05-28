@@ -40,6 +40,7 @@ export type RolleasePermission =
   | "release.deploy"
   | "release.rollback"
   | "release.approve"
+  | "release.reject"
   | "webhook.manage"
   | "tag.manage"
   | "admin.full";
@@ -60,6 +61,8 @@ const DEFAULT_PERMISSIONS: Record<RolleaseRole, Set<RolleasePermission>> = {
     "tag.manage",
     "segment.manage",
     "release.create",
+    "release.approve",
+    "release.reject",
   ]),
   admin: new Set([
     "flag.read",
@@ -77,6 +80,7 @@ const DEFAULT_PERMISSIONS: Record<RolleaseRole, Set<RolleasePermission>> = {
     "release.deploy",
     "release.rollback",
     "release.approve",
+    "release.reject",
     "webhook.manage",
   ]),
   owner: new Set([
@@ -95,6 +99,7 @@ const DEFAULT_PERMISSIONS: Record<RolleaseRole, Set<RolleasePermission>> = {
     "release.deploy",
     "release.rollback",
     "release.approve",
+    "release.reject",
     "webhook.manage",
     "admin.full",
   ]),
@@ -135,6 +140,7 @@ const ACTION_PERMISSION_MAP: Record<string, RolleasePermission> = {
   "release.deployed": "release.deploy",
   "release.rolled_back": "release.rollback",
   "release.approved": "release.approve",
+  "release.rejected": "release.reject",
   "tags.added": "tag.manage",
   "tags.removed": "tag.manage",
 };
@@ -243,6 +249,11 @@ export function createRBACHook(
 /**
  * Create an `adminAuth` function for `RolleaseHandlerOptions` from an RBAC policy.
  *
+ * The returned function returns `true` when the extracted actor has at least
+ * `flag.create` permission (i.e. editor or above). Individual operation
+ * permissions are enforced by the `onBeforeMutation` hook; this gate prevents
+ * unauthenticated callers from reaching admin routes at all.
+ *
  * ```ts
  * const handler = rl.createHandler({
  *   adminAuth: createRBACAdminAuth(policy, extractActorFromReq),
@@ -255,7 +266,8 @@ export function createRBACAdminAuth(
 ): (req: Request) => Promise<boolean> {
   return async (req) => {
     const actor = await extractActor(req);
-    // Admin routes require at least flag.read permission
-    return policy.check(actor, "flag.read") as boolean | Promise<boolean> as Promise<boolean>;
+    if (!actor) return false;
+    // Admin routes require at least flag.create (editor+). Viewers are denied.
+    return policy.check(actor, "flag.create") as boolean | Promise<boolean> as Promise<boolean>;
   };
 }

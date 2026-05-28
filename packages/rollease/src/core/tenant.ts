@@ -254,6 +254,42 @@ export function createTenantAdapter(
 
     // ── Optional methods ─────────────────────────────────────────────────
 
+    ...(inner.getUserAssignments && {
+      async getUserAssignments(flagKeys: string[], userId: string): Promise<Record<string, string>> {
+        const nsKeys = flagKeys.map(ns);
+        const raw = await inner.getUserAssignments!(nsKeys, userId);
+        const out: Record<string, string> = {};
+        for (const [k, v] of Object.entries(raw)) {
+          out[uns(k)] = v;
+        }
+        return out;
+      },
+    }),
+
+    ...(inner.touchFlagEvaluation && {
+      async touchFlagEvaluation(key: string): Promise<void> {
+        return inner.touchFlagEvaluation!(ns(key));
+      },
+    }),
+
+    ...(inner.listScheduledReleases && {
+      async listScheduledReleases(): Promise<Release[]> {
+        return inner.listScheduledReleases!();
+      },
+    }),
+
+    ...(inner.approveRelease && {
+      async approveRelease(releaseId: string, approverId: string): Promise<Release> {
+        return inner.approveRelease!(releaseId, approverId);
+      },
+    }),
+
+    ...(inner.rejectRelease && {
+      async rejectRelease(releaseId: string, rejectorId: string, reason?: string): Promise<Release> {
+        return inner.rejectRelease!(releaseId, rejectorId, reason);
+      },
+    }),
+
     ...(inner.trackEvent && {
       async trackEvent(input: TrackEventInput): Promise<TrackingEvent> {
         return inner.trackEvent!(input);

@@ -78,6 +78,8 @@ import {
   noopLogger,
   type RolleaseLogger,
 } from "../core/logger";
+import type { MetricsAdapter } from "../core/metrics";
+import { createExposureTracker, type ExposureTracker } from "../core/exposure";
 
 type ChangeListener = (event: {
   flagKey: string;
@@ -105,7 +107,7 @@ export class FlagManager {
   private localOverridesFile: string;
   private listeners: ChangeListener[] = [];
   private hooks: RolleaseHooks;
-  private impressions: Required<ImpressionConfig>;
+  private impressions: Required<Omit<ImpressionConfig, "dedupe">> & Pick<ImpressionConfig, "dedupe">;
   private logger: RolleaseLogger;
   private evaluateAllPageSize: number;
   private autoResolveSegments: boolean;
@@ -127,6 +129,9 @@ export class FlagManager {
   private circuitFailures = 0;
   private circuitWindowStartedAt = Date.now();
   private circuitOpenedAt = 0;
+  private metrics?: MetricsAdapter;
+  private exposureTracker?: ExposureTracker;
+  private dbReader?: DbAdapter;
 
   constructor(opts: {
     db: DbAdapter;
@@ -146,6 +151,8 @@ export class FlagManager {
     privacy?: PrivacyConfig;
     telemetry?: TelemetryAdapter;
     invalidationBus?: InvalidationBus;
+    metrics?: MetricsAdapter;
+    dbReader?: DbAdapter;
   }) {
     this.db = opts.db;
     this.l1Cache = new MemoryCacheAdapter();
@@ -158,7 +165,13 @@ export class FlagManager {
     this.impressions = {
       enabled: opts.impressions?.enabled ?? true,
       sampleRate: opts.impressions?.sampleRate ?? 1,
+      dedupe: opts.impressions?.dedupe,
     };
+    this.metrics = opts.metrics;
+    this.dbReader = opts.dbReader;
+    if (opts.impressions?.dedupe) {
+      this.exposureTracker = createExposureTracker(opts.impressions.dedupe);
+    }
     this.logger = opts.logger ?? noopLogger;
     this.evaluateAllPageSize = opts.evaluateAllPageSize ?? DEFAULT_PAGE_SIZE;
     this.autoResolveSegments = opts.autoResolveSegments ?? false;
@@ -507,7 +520,7 @@ export class FlagManager {
 
   async evaluateAllDetailed(
     context: FlagContext,
-    opts?: { keys?: string[]; namespace?: string; tags?: string[] }
+    opts?: { keys?: string[]; namespace?: string; tags?: string[]; trace?: boolean }
   ): Promise<DetailedFlagMap> {
     if (opts?.keys && opts.keys.length === 0) return {};
 
@@ -628,8 +641,10 @@ export class FlagManager {
         exclusionLayer,
         prerequisiteResults,
         onWarning: (msg, meta) => this.logger.warn(msg, meta),
+        trace: opts?.trace,
       });
       result[flag.key] = evalResult;
+      this.metrics?.increment("rollease_evaluations_total", { flag: flag.key });
       this.maybeTrackImpression(evalResult, activeContext);
       this.fireOnEvaluate(evalResult, activeContext);
       this.touchFlagEvaluation(flag.key);
@@ -910,14 +925,9 @@ export class FlagManager {
   // ── Releases ─────────────────────────────────────────────────────────
 
   async createRelease(input: CreateReleaseInput): Promise<Release> {
-    // Run the mutation hook so RBAC can deny release creation. The
-    // history-action `release.created` doesn't exist yet — we use the
-    // closest-fit `release.deployed` for hook context so RBAC can gate
-    // either operation through the same predicate. The actual history
-    // entry is written by the database adapter on createRelease.
-    await this.runMutationHook("release.deployed", undefined, input.actor);
+    await this.runMutationHook("release.created", undefined, input.actor);
     const release = await this.db.createRelease(input);
-    this.webhookDispatcher.dispatch("release.deployed", undefined, {
+    this.webhookDispatcher.dispatch("release.created", undefined, {
       releaseId: release.id,
       pending: true,
       requiresApproval: release.requiresApproval ?? false,
@@ -1079,6 +1089,11 @@ export class FlagManager {
       uptimeMs: Date.now() - this.startedAt,
       ts: Date.now(),
     };
+  }
+
+  /** Return serialized Prometheus-format metrics. Returns empty string when no metrics adapter is configured. */
+  getMetrics(): string {
+    return this.metrics?.serialize() ?? "";
   }
 
   // ── Privacy / GDPR ───────────────────────────────────────────────────
@@ -1328,13 +1343,20 @@ export class FlagManager {
     callOptions?: { trace?: boolean }
   ): Promise<FlagResult<T>> {
     this.evalCount++;
+    this.metrics?.increment("rollease_evaluations_total", { flag: key });
+    const start = Date.now();
     const span = this.telemetry?.startSpan("rollease.evaluate", { "flag.key": key });
     try {
       const result = await this.evaluateInternal<T>(key, context, undefined, callOptions?.trace);
+      span?.setAttribute("flag.value", String(result.value));
+      span?.setAttribute("flag.reason", result.reason);
+      span?.setAttribute("flag.variant", result.variant ?? "");
       span?.end("ok");
+      this.metrics?.histogram("rollease_evaluation_duration_seconds", (Date.now() - start) / 1000, { flag: key });
       return result;
     } catch (err) {
       span?.end("error", err instanceof Error ? err : new Error(String(err)));
+      this.metrics?.increment("rollease_errors_total", { flag: key, operation: "evaluate" });
       if (this.resilience.fallbackOnError) {
         this.logger.warn("evaluate failed, returning fallback", {
           flagKey: key,
@@ -1382,6 +1404,17 @@ export class FlagManager {
 
     const flag = await this.getFlagCached(key);
     if (!flag) {
+      return missingFlagResult<T>(key);
+    }
+
+    // Environment filter: if the flag is scoped to specific environments and the
+    // current context specifies an environment, skip flags not targeting it.
+    if (
+      context.environment &&
+      flag.environments &&
+      flag.environments.length > 0 &&
+      !flag.environments.includes(context.environment)
+    ) {
       return missingFlagResult<T>(key);
     }
 
@@ -1573,6 +1606,7 @@ export class FlagManager {
     const l1Hit = await this.l1Cache.get(cacheKey);
     if (l1Hit !== null) {
       this.cacheHitCount++;
+      this.metrics?.increment("rollease_cache_hits_total", { tier: "l1", flag: key });
       return parseCachedFlag(l1Hit);
     }
 
@@ -1581,6 +1615,7 @@ export class FlagManager {
       const l2Hit = await this.l2Cache.get(cacheKey);
       if (l2Hit !== null) {
         this.cacheHitCount++;
+        this.metrics?.increment("rollease_cache_hits_total", { tier: "l2", flag: key });
         await this.l1Cache.set(cacheKey, l2Hit, this.l1TtlMs);
         return parseCachedFlag(l2Hit);
       }
@@ -1588,7 +1623,9 @@ export class FlagManager {
 
     // DB
     this.cacheMissCount++;
-    const flag = await this.withDbResilience("getFlag", () => this.db.getFlag(key));
+    this.metrics?.increment("rollease_cache_misses_total", { flag: key });
+    const dbToUse = this.dbReader ?? this.db;
+    const flag = await this.withDbResilience("getFlag", () => dbToUse.getFlag(key));
     if (flag) {
       const serialized = JSON.stringify(flag);
       await this.l1Cache.set(cacheKey, serialized, this.l1TtlMs);
@@ -1779,7 +1816,8 @@ export class FlagManager {
     context: FlagContext
   ): Promise<void> {
     if (!this.hooks.onBeforeEvaluation) return;
-    await this.hooks.onBeforeEvaluation({ flagKey, context });
+    // Pass scrubbed context so PII never reaches hook handlers.
+    await this.hooks.onBeforeEvaluation({ flagKey, context: this.scrubContext(context) });
   }
 
   private fireOnEvaluate(result: FlagResult, context: FlagContext): void {
@@ -1806,7 +1844,12 @@ export class FlagManager {
     ) {
       return;
     }
+    // Deduplication: skip if this (user, flag, value) was tracked recently.
+    if (this.exposureTracker && !this.exposureTracker.shouldTrack(result, context)) {
+      return;
+    }
     const safe = this.scrubContext(context);
+    this.metrics?.increment("rollease_impressions_total", { flag: result.key, reason: result.reason });
     // Fire-and-forget — never block evaluation on impression IO.
     this.db
       .trackImpression({
@@ -1827,10 +1870,14 @@ export class FlagManager {
   private scrubContext(ctx: FlagContext): FlagContext {
     if (!this.privacy.privateAttributes?.length) return ctx;
     const attrs = { ...(ctx.attributes ?? {}) };
+    const scrubbed: Record<string, unknown> = { ...ctx };
     for (const k of this.privacy.privateAttributes) {
+      // Scrub from ctx.attributes
       if (k in attrs) attrs[k] = "[REDACTED]";
+      // Also scrub top-level FlagContext fields (userId, region, tenantId, ip, etc.)
+      if (k in scrubbed) scrubbed[k] = "[REDACTED]";
     }
-    return { ...ctx, attributes: attrs };
+    return { ...scrubbed, attributes: attrs } as FlagContext;
   }
 
   // ── Prerequisite Validation ───────────────────────────────────────────

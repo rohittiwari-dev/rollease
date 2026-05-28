@@ -319,7 +319,7 @@ describe("Phase 2-D: Manager lifecycle wiring", () => {
     });
 
     const released: WebhookPayload[] = [];
-    manager.on("release.deployed", (p) => {
+    manager.on("release.created", (p) => {
       released.push(p);
     });
 
@@ -332,7 +332,8 @@ describe("Phase 2-D: Manager lifecycle wiring", () => {
 
     // create() + createRelease() both run the hook.
     expect(beforeHookCalls.some((c) => c.action === "flag.created" && c.flagKey === "rel_flag")).toBe(true);
-    expect(beforeHookCalls.some((c) => c.action === "release.deployed" && c.flagKey === undefined)).toBe(true);
+    // createRelease fires "release.created" (distinct from "release.deployed").
+    expect(beforeHookCalls.some((c) => c.action === "release.created" && c.flagKey === undefined)).toBe(true);
 
     // Webhook fires for createRelease with pending: true.
     expect(released).toHaveLength(1);

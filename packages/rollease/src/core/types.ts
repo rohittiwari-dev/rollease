@@ -67,8 +67,21 @@ export interface RolleaseConfig {
   privacy?: PrivacyConfig;
   /** OpenTelemetry / custom telemetry integration */
   telemetry?: TelemetryAdapter;
+  /**
+   * Pluggable metrics adapter. Use `createPrometheusAdapter()` from
+   * `rollease/metrics` or supply any `MetricsAdapter` implementation.
+   * When provided, the SDK automatically tracks evaluations, cache hits/misses,
+   * errors, impressions, and DB latency.
+   */
+  metrics?: import("./metrics").MetricsAdapter;
   /** Cross-process invalidation bus for multi-replica cache/SSE coherence. */
   invalidation?: import("../db/adapter").InvalidationBus;
+  /**
+   * Optional read-replica DB adapter. When provided, all evaluation reads
+   * (getFlag, listRules, getUserAssignment) use this adapter; all writes use
+   * the primary `db` adapter.
+   */
+  dbReader?: import("../db/adapter").DbAdapter;
 }
 
 export interface ResilienceConfig {
@@ -148,6 +161,19 @@ export interface ImpressionConfig {
   enabled?: boolean;
   /** Sample rate 0..1 (default 1.0). 0 disables, 1 tracks every evaluation. */
   sampleRate?: number;
+  /**
+   * Deduplication settings for impression tracking. When enabled, the SDK
+   * suppresses duplicate impressions for the same user+flag+value within a
+   * time window. Without this, every evaluate() call records an impression.
+   */
+  dedupe?: {
+    /** Window in ms within which duplicate impressions are suppressed. Default: 60_000 (1 min). */
+    windowMs?: number;
+    /** Max dedup cache entries before eviction. Default: 10_000. */
+    maxEntries?: number;
+    /** Fields that form the dedup key. Default: ["flagKey","userId","value"]. */
+    keyFields?: Array<"flagKey" | "userId" | "value" | "variant" | "reason">;
+  };
 }
 
 export interface TrackEventInput {
@@ -580,6 +606,7 @@ export type HistoryAction =
   | "rule.reordered"
   | "rollout.set"
   | "variant.updated"
+  | "release.created"
   | "release.deployed"
   | "release.rolled_back"
   | "release.approved"
