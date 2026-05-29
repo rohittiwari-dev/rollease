@@ -79,13 +79,15 @@ Rollease SDK — Status Report (updated 2026-05-29, completion pass — all non-
 ├─────────────────────────────────────────────────────┼────────────────────────────┼────────────────────────────────────────────────────────┤
 │ Client-side SDK key (read-only, public)             │ LD, Statsig, ConfigCat     │ ✅ clientKeys + browser clientKey header/query          │
 ├─────────────────────────────────────────────────────┼────────────────────────────┼────────────────────────────────────────────────────────┤
-│ SDK key rotation                                    │ LD, Statsig                │ ❌                                                     │
+│ SDK key rotation                                    │ LD, Statsig                │ ✅ config.signingKeys[] key ring — all keys accepted   │
+│                                                     │                            │    for verification; currentSigningKeyId signs new tokens│
 ├─────────────────────────────────────────────────────┼────────────────────────────┼────────────────────────────────────────────────────────┤
 │ Per-environment keys                                │ LD, Statsig, GrowthBook    │ ❌ (only config.environment filter)                    │
 ├─────────────────────────────────────────────────────┼────────────────────────────┼────────────────────────────────────────────────────────┤
 │ SDK metadata (name/version) auto-attached to events │ LD, Statsig                │ ❌                                                     │
 ├─────────────────────────────────────────────────────┼────────────────────────────┼────────────────────────────────────────────────────────┤
-│ Anonymous bucketing keys                            │ LD, GrowthBook             │ ❌ no fallback device-id when userId absent             │
+│ Anonymous bucketing keys                            │ LD, GrowthBook             │ ✅ browser client auto-generates stable anonymousId    │
+│                                                     │                            │    (localStorage-persisted); used as userId fallback    │
 └─────────────────────────────────────────────────────┴────────────────────────────┴────────────────────────────────────────────────────────┘
 
 ---
@@ -99,7 +101,8 @@ Rollease SDK — Status Report (updated 2026-05-29, completion pass — all non-
 ├──────────────────────────────────────────────┼───────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
 │ Browser client SSE subscription              │ LD, Statsig                           │ ✅ EventSource + onChange() in rollease/client                │
 ├──────────────────────────────────────────────┼───────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
-│ Polling with conditional GET (ETag)          │ LD, GrowthBook                        │ ❌                                                           │
+│ Polling with conditional GET (ETag)          │ LD, GrowthBook                        │ ✅ GET /flags returns ETag; client sends If-None-Match;      │
+│                                              │                                       │    304 on no change. Reduces bandwidth + server load.        │
 ├──────────────────────────────────────────────┼───────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
 │ Offline / disk-persisted cache               │ LD, Statsig                           │ ⚠️  localStorage in browser client; no server-side disk      │
 ├──────────────────────────────────────────────┼───────────────────────────────────────┼──────────────────────────────────────────────────────────────┤
@@ -148,7 +151,8 @@ Environment filter is now consistent: both `evaluate()` and `evaluateAll/evaluat
 │ Private/PII attributes (redacted from events + hooks)          │ LD privateAttributes          │ ✅ privacy.privateAttributes scrubs ctx.attributes AND top-level      │
 │                                                                │                               │    fields (userId, region, tenantId, ip). Hook receives scrubbed ctx. │
 ├────────────────────────────────────────────────────────────────┼───────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
-│ Anonymous user bucketing                                       │ LD, GrowthBook                │ ❌ no fallback device-id when userId absent                           │
+│ Anonymous user bucketing                                       │ LD, GrowthBook                │ ✅ browser client auto-generates stable anonymousId; server           │
+│                                                                │                               │    uses it as userId for consistent bucketing before sign-in         │
 ├────────────────────────────────────────────────────────────────┼───────────────────────────────┼──────────────────────────────────────────────────────────────────────┤
 │ Eval-trace ("why did user X get value Y?")                     │ Statsig, GrowthBook           │ ✅ evaluate(key, ctx, { trace: true }) and evaluateAllDetailed({ trace │
 │                                                                │                               │    : true }) → FlagResult.trace with per-step matched/detail. 13 tests│
@@ -198,7 +202,8 @@ Environment filter is now consistent: both `evaluate()` and `evaluateAll/evaluat
 ├──────────────────────────────────────────────────────────────┼───────────────────────────────────┼──────────────────────────────────────────────────────────────────┤
 │ GitOps (sync from YAML in repo)                              │ Unleash, GrowthBook               │ ❌                                                               │
 ├──────────────────────────────────────────────────────────────┼───────────────────────────────────┼──────────────────────────────────────────────────────────────────┤
-│ OpenAPI / Postman collection                                 │ LD, Statsig                       │ ❌ openapi.ts exists but not auto-generated from routes           │
+│ OpenAPI / Postman collection                                 │ LD, Statsig                       │ ✅ GET /openapi.json (admin-gated) returns auto-generated         │
+│                                                              │                                   │    OpenAPI 3.1 spec. Postman import from that endpoint.           │
 └──────────────────────────────────────────────────────────────┴───────────────────────────────────┴──────────────────────────────────────────────────────────────────┘
 
 Routes exposed by the universal handler:
@@ -236,6 +241,8 @@ Routes exposed by the universal handler:
     POST   /admin/releases/:id/rollback     — rollback release
     POST   /admin/releases/:id/approve      — approve release
     POST   /admin/releases/:id/reject       — reject release
+    GET    /admin/users/:userId/impressions — per-user flag exposure list (GDPR right-to-explanation)
+    GET    /openapi.json                    — OpenAPI 3.1 spec (auto-generated)
 
 ---
 
@@ -317,9 +324,11 @@ Routes exposed by the universal handler:
 │ Handler error leakage (internal DB messages to clients)                    │ OWASP API Top 10      │ ✅ safeErrMsg() — only ValidationError class messages surface;     │
 │                                                                            │                       │    all others return "Internal server error" and log internally.  │
 ├────────────────────────────────────────────────────────────────────────────┼───────────────────────┼────────────────────────────────────────────────────────────────────┤
-│ Right-to-explanation (per-user exposure list)                              │ LD                    │ ❌ history has flagKey, no efficient per-user query                 │
+│ Right-to-explanation (per-user exposure list)                              │ LD                    │ ✅ getUserImpressions(userId, opts) in manager + adapter;           │
+│                                                                            │                       │    GET /admin/users/:userId/impressions HTTP route.                │
 ├────────────────────────────────────────────────────────────────────────────┼───────────────────────┼────────────────────────────────────────────────────────────────────┤
-│ SDK key rotation model                                                     │ LD, Statsig           │ ❌                                                                 │
+│ SDK key rotation model                                                     │ LD, Statsig           │ ✅ config.signingKeys key ring. Zero-downtime rotation: deploy     │
+│                                                                            │                       │    new key, keep old — both verified; remove old after rollout.   │
 ├────────────────────────────────────────────────────────────────────────────┼───────────────────────┼────────────────────────────────────────────────────────────────────┤
 │ IP allowlist for admin API                                                 │ LD                    │ ❌                                                                 │
 └────────────────────────────────────────────────────────────────────────────┴───────────────────────┴────────────────────────────────────────────────────────────────────┘
@@ -382,9 +391,9 @@ Routes exposed by the universal handler:
 ├───────────────────────────────┼────────────────────────────────────────────────────────────────────┤
 │ Cloudflare Workers            │ ✅ source compatible; lazy fs guard; Cloudflare KV adapter ships  │
 ├───────────────────────────────┼────────────────────────────────────────────────────────────────────┤
-│ Vercel Edge                   │ ✅ source compatible; no Vercel KV adapter                         │
+│ Vercel Edge                   │ ✅ source compatible; Vercel KV adapter ships (rollease/db/vercel-kv)│
 ├───────────────────────────────┼────────────────────────────────────────────────────────────────────┤
-│ Deno                          │ ✅ source compatible; no Deno KV adapter                           │
+│ Deno                          │ ✅ source compatible; Deno KV adapter ships (rollease/db/deno-kv)  │
 ├───────────────────────────────┼────────────────────────────────────────────────────────────────────┤
 │ Browser (vanilla)             │ ✅ rollease/client — zero Node deps                                │
 ├───────────────────────────────┼────────────────────────────────────────────────────────────────────┤
@@ -419,7 +428,8 @@ Present: Memory, Prisma, Drizzle, Sequelize, Redis cache (L1 in-process + L2 Red
 
 15. Rollout / Experimentation Statistics (P2)
 
-❌ All statistical features (sample-size calculator, p-values, confidence intervals, CUPED, sequential testing, multi-arm bandit). Recommendation: ship hooks/exports so users plug in their own stats backend.
+✅ Hook layer — `createExperimentHooks(backend)` and `withExperimentHooks()` bridge flag evaluations to external stats backends. Expose/convert callbacks fire on experiment-class eval reasons.
+❌ Computation layer — sample-size calculator, p-values, confidence intervals, CUPED, sequential testing, multi-arm bandit. Intentionally deferred; use Statsig, GrowthBook, or a custom backend via the hooks above.
 
 ---
 
@@ -444,6 +454,7 @@ Present: Memory, Prisma, Drizzle, Sequelize, Redis cache (L1 in-process + L2 Red
 ✅ Cache hit-rate metrics tracked in rl.health() and Prometheus adapter
 ✅ Redis pub/sub invalidation across replicas when RedisInvalidationBus is configured
 ✅ Exposure dedup — impressions.dedupe suppresses duplicate impressions within window
+✅ ETag / conditional GET — GET /flags returns ETag; browser client sends If-None-Match; 304 on no change
 ❌ Service Worker cache for browser client
 ❌ Precomputed evaluation tables
 ❌ CDN-cacheable evaluation responses
@@ -474,9 +485,10 @@ Present: Memory, Prisma, Drizzle, Sequelize, Redis cache (L1 in-process + L2 Red
 
 19. Multi-Tenancy (P1 for B2B SaaS)
 
-⚠️ `createTenantAdapter(innerDb, { tenantId })` shipped — wraps all flag/rule/segment/assignment/history CRUD with tenant-namespaced keys. All optional methods now forwarded correctly. Remaining gap:
-- Manager L1/L2 cache keys (`rollease:flag:${key}`) are NOT tenant-scoped. Two tenants with the same flag key share the same cache entry. Fix requires prefixing cache keys at the manager level.
-- Per-tenant rate limiting and per-tenant analytics still open.
+✅ `createTenantAdapter(innerDb, { tenantId })` — wraps all flag/rule/segment/assignment/history CRUD with tenant-namespaced keys. All optional DbAdapter methods forwarded (getUserAssignments, touchFlagEvaluation, listScheduledReleases, approveRelease, rejectRelease).
+✅ `config.cacheNamespace` — when set (e.g. to tenantId), all L1/L2 cache keys are prefixed (`rollease:<ns>:flag:<key>`), preventing cross-tenant cache collisions when a shared Redis cache is used.
+❌ Per-tenant rate limiting — still open.
+❌ Per-tenant analytics (separate metric namespaces per tenant) — still open.
 
 ---
 
@@ -531,24 +543,24 @@ Note: the OpenFeature provider (`rollease/openfeature`) means any team already o
 
 Present: README, CHANGELOG, adapter examples, apps/example/ Next.js demo, developer-guide.md.
 
+✅ OpenAPI spec — `GET /openapi.json` (admin-gated) returns a live OpenAPI 3.1 document generated by `core/openapi.ts`.
 ❌ API reference auto-generated from JSDoc (TypeDoc)
 ❌ Interactive playground (CodeSandbox or in-docs REPL)
 ❌ Architecture diagrams
-❌ OpenAPI spec auto-generated from handler routes (openapi.ts exists but not wired to routes)
 ❌ Documentation site (VitePress / Starlight)
 
 ---
 
 24. Build / Release Pipeline (P3)
 
-Current: tsup builds CJS + ESM + DTS, 220 tests pass, build clean.
+Current: tsup builds CJS + ESM + DTS, 227 tests pass, build clean.
 
-❌ GitHub Actions CI matrix (Node 18/20/22, Bun, Edge runtime)
-❌ Semantic-release / changesets
-❌ Coverage gate thresholds enforced in CI
+✅ GitHub Actions CI — `.github/workflows/ci.yml`: lint + type check, test (Node 18/20/22 + Bun matrix), build + entry-point verification, coverage gate (≥80%), npm pack dry-run, edge-runtime smoke, bundle size <2MB, release step on main.
+✅ npm publish pipeline — `.github/workflows/publish.yml`: publishes on version tags.
+❌ Semantic-release / changesets (CHANGELOG is maintained manually)
+❌ Coverage gate enforced in CI (configured but threshold may need tuning to current coverage)
 ❌ E2E test against real Postgres
-❌ Bundle-size budget enforcement
-❌ Publish provenance / SLSA attestation
+❌ Publish provenance / SLSA attestation (uncomment in publish.yml when ready)
 
 ---
 
@@ -572,7 +584,7 @@ All items shipped and tested. All Phase 1 security/wiring bugs fixed.
 7. ✅ React Native client
 8. ✅ Vue + Svelte + Angular integrations
 9. ✅ Express / Fastify / Hono / Koa typed middleware wrappers
-10. ⚠️ Custom event tracking shipped; conversion attribution and metric joins remain open
+10. ✅ Custom event tracking — browser batching, /events handler, FlagManager.trackEvent(), Memory + Repository + Sequelize persistence. Attribution joins and stats deferred to experiment hook layer.
 11. ✅ Exposure deduplication — wired into manager via impressions.dedupe
 12. ✅ Prometheus metrics endpoint — wired into FlagManager + handler
 
