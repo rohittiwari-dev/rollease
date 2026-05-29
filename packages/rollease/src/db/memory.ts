@@ -975,6 +975,20 @@ export class MemoryDbAdapter implements DbAdapter {
     return events.slice(-limit);
   }
 
+  async getUserImpressions(
+    userId: string,
+    opts?: { limit?: number; flagKey?: string }
+  ): Promise<Array<{ flagKey: string; userId: string; value: unknown; variant: string | null; reason: string; at: Date }>> {
+    let imps = this.impressions.filter(
+      (i) => i["userId"] === userId
+    ) as Array<{ flagKey: string; userId: string; value: unknown; variant: string | null; reason: string; at: Date }>;
+    if (opts?.flagKey) {
+      imps = imps.filter((i) => i.flagKey === opts.flagKey);
+    }
+    const limit = opts?.limit ?? imps.length;
+    return imps.slice(-limit);
+  }
+
   // ── Scheduled Releases ────────────────────────────────────────────────
 
   async listScheduledReleases(): Promise<import("../core/types").Release[]> {

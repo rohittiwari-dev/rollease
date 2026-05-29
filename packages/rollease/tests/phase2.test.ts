@@ -45,12 +45,13 @@ describe("Phase 2-A: Edge-safe webhook dispatcher", () => {
     // The webhook module is the surface: importing it should not require
     // node:crypto. Verify the produced signature round-trips through the
     // public verifier (which uses SubtleCrypto end-to-end).
-    const mockFetch = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      statusText: "OK",
-    });
-    vi.stubGlobal("fetch", mockFetch);
+    const mockCalls: Array<[string, RequestInit]> = [];
+    const mockFetch = (url: string, init: RequestInit) => {
+      mockCalls.push([url, init]);
+      return Promise.resolve({ ok: true, status: 200, statusText: "OK" } as Response);
+    };
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
 
     const { manager } = mgr({
       webhooks: [
@@ -65,8 +66,9 @@ describe("Phase 2-A: Edge-safe webhook dispatcher", () => {
     await manager.create({ key: "edge_safe", type: "boolean", defaultValue: true });
     await new Promise((r) => setTimeout(r, 30));
 
-    expect(mockFetch).toHaveBeenCalledTimes(1);
-    const [, init] = mockFetch.mock.calls[0] as [string, RequestInit];
+    globalThis.fetch = origFetch;
+    expect(mockCalls).toHaveLength(1);
+    const [, init] = mockCalls[0];
     const headers = init.headers as Record<string, string>;
     expect(headers["X-Rollease-Signature"]).toMatch(/^[0-9a-f]+$/);
     expect(headers["X-Rollease-Signature-Version"]).toBe("v1");
@@ -90,7 +92,6 @@ describe("Phase 2-A: Edge-safe webhook dispatcher", () => {
     );
     expect(bad).toBe(false);
 
-    vi.unstubAllGlobals();
   });
 
   it("rejects replayed webhook envelopes past maxAge", async () => {

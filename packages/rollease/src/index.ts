@@ -194,6 +194,10 @@ export type {
 export { createTenantAdapter } from "./core/tenant";
 export type { TenantAdapterConfig } from "./core/tenant";
 
+// ── Experiment Hooks ───────────────────────────────────────────────────────
+export { createExperimentHooks, withExperimentHooks, EXPERIMENT_REASONS } from "./core/experiment";
+export type { ExperimentBackend } from "./core/experiment";
+
 // ── Utilities ──────────────────────────────────────────────────────────────
 export { getBucket, murmurhash3_32 } from "./bucket";
 export { loadLocalOverrides } from "./overrides";
@@ -387,6 +391,8 @@ export function createRollease(config: RolleaseConfig): RolleaseClient {
     invalidationBus: config.invalidation,
     metrics: config.metrics,
     dbReader: config.dbReader,
+    cacheNamespace: config.cacheNamespace,
+    audit: config.audit,
   });
 
   // Capture the secret in a closure so it never appears on the public client
@@ -412,9 +418,20 @@ export function createRollease(config: RolleaseConfig): RolleaseClient {
     },
   };
 
+  // Build the signing key ring. The current key is used for signing new tokens;
+  // all keys are accepted for verification to support gradual rotation.
+  const signingKeyRing = config.signingKeys ?? [{ kid: "default", secret }];
+  const currentKeyId = config.currentSigningKeyId ?? signingKeyRing[0].kid;
+  const currentKeySecret = signingKeyRing.find((k) => k.kid === currentKeyId)?.secret ?? secret;
+
   // Symbol-keyed slot. Invisible to property enumeration; ignored by JSON.
+  // Exposes { getSecret, getKeyRing } for use by the Next.js middleware only.
   Object.defineProperty(client, INTERNAL_SECRET, {
-    value: () => secret,
+    value: () => ({
+      secret: currentKeySecret,
+      keyRing: signingKeyRing,
+      currentKeyId,
+    }),
     enumerable: false,
     configurable: false,
     writable: false,

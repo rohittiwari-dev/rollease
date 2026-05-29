@@ -97,8 +97,8 @@ export function rolleaseMiddleware(
         keys: options.flags,
       });
 
-      const secret = resolveMiddlewareSecret(client, options.secret);
-      const envelope = await createSignedDetailedPayload(detailed, secret);
+      const signingInfo = resolveMiddlewareSecret(client, options.secret);
+      const envelope = await createSignedDetailedPayload(detailed, signingInfo.secret);
 
       if (envelope.length > maxPayloadBytes) {
         console.warn(
@@ -272,10 +272,12 @@ interface SerializedFlagResult {
 
 async function readSignedEnvelope(
   envelope: string,
-  secret: string,
+  signingInfo: ResolvedSigningInfo | string,
   opts: { maxAgeMs?: number; now?: number } = {}
 ): Promise<ParsedTransport | null> {
-  assertTransportSecret(secret);
+  const info: ResolvedSigningInfo =
+    typeof signingInfo === "string" ? { secret: signingInfo } : signingInfo;
+  assertTransportSecret(info.secret);
   if (!envelope || envelope.length > MAX_TRANSPORT_LENGTH) return null;
 
   const [version, payload, signature, ...extra] = envelope.split(".");
@@ -285,8 +287,16 @@ async function readSignedEnvelope(
   const isV2 = version === `v${TRANSPORT_VERSION}`;
   if (!isV1 && !isV2) return null;
 
-  const expected = await hmacSha256(payload, secret);
-  if (!constantTimeEqual(signature, expected)) return null;
+  // Try all keys in the ring — allows gradual secret rotation.
+  const candidates = info.keyRing?.length
+    ? info.keyRing.map((k) => k.secret)
+    : [info.secret];
+  let verified = false;
+  for (const candidateSecret of candidates) {
+    const expected = await hmacSha256(payload, candidateSecret);
+    if (constantTimeEqual(signature, expected)) { verified = true; break; }
+  }
+  if (!verified) return null;
 
   try {
     const decoded = JSON.parse(decodeUtf8FromBase64Url(payload)) as {
@@ -382,16 +392,29 @@ async function parseTransportValue(
   }
 }
 
-function resolveMiddlewareSecret(client: RolleaseClient, override?: string): string {
+interface ResolvedSigningInfo {
+  secret: string;
+  keyRing?: Array<{ kid: string; secret: string }>;
+}
+
+function resolveMiddlewareSecret(client: RolleaseClient, override?: string): ResolvedSigningInfo {
   const internalGetter = (client as WithInternalSecret)[INTERNAL_SECRET];
   const fromInternal = typeof internalGetter === "function" ? internalGetter() : undefined;
+  // fromInternal may be { secret, keyRing, currentKeyId } (new) or a string (old shim).
+  if (override) {
+    assertTransportSecret(override);
+    return { secret: override };
+  }
+  if (fromInternal && typeof fromInternal === "object" && "secret" in fromInternal) {
+    const info = fromInternal as { secret: string; keyRing: Array<{ kid: string; secret: string }> };
+    assertTransportSecret(info.secret);
+    return { secret: info.secret, keyRing: info.keyRing };
+  }
   // Backwards-compat shim: older client objects exposed `__rollease.secret`.
-  // Keep it readable for one release while consumers migrate.
-  const legacy =
-    (client as { __rollease?: { secret?: string } }).__rollease?.secret;
-  const secret = override ?? fromInternal ?? legacy ?? readEnvSecret();
+  const legacy = (client as { __rollease?: { secret?: string } }).__rollease?.secret;
+  const secret = (fromInternal as string | undefined) ?? legacy ?? readEnvSecret();
   assertTransportSecret(secret);
-  return secret;
+  return { secret };
 }
 
 function assertTransportSecret(secret: unknown): asserts secret is string {

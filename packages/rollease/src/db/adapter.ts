@@ -215,6 +215,19 @@ export interface DbAdapter {
     limit?: number;
   }): Promise<TrackingEvent[]>;
 
+  /**
+   * Return impression records for a specific user — supports right-to-explanation.
+   * Optional: fall back to filtering all impressions when absent.
+   */
+  getUserImpressions?(userId: string, opts?: { limit?: number; flagKey?: string }): Promise<Array<{
+    flagKey: string;
+    userId: string;
+    value: unknown;
+    variant: string | null;
+    reason: string;
+    at: Date;
+  }>>;
+
   // ── Bulk Operations ──────────────────────────────────────────────────
 
   /**

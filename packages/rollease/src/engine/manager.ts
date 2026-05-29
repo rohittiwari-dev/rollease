@@ -132,6 +132,8 @@ export class FlagManager {
   private metrics?: MetricsAdapter;
   private exposureTracker?: ExposureTracker;
   private dbReader?: DbAdapter;
+  private cacheNamespace: string;
+  private audit?: import("../core/types").AuditConfig;
 
   constructor(opts: {
     db: DbAdapter;
@@ -153,6 +155,8 @@ export class FlagManager {
     invalidationBus?: InvalidationBus;
     metrics?: MetricsAdapter;
     dbReader?: DbAdapter;
+    cacheNamespace?: string;
+    audit?: import("../core/types").AuditConfig;
   }) {
     this.db = opts.db;
     this.l1Cache = new MemoryCacheAdapter();
@@ -169,6 +173,8 @@ export class FlagManager {
     };
     this.metrics = opts.metrics;
     this.dbReader = opts.dbReader;
+    this.cacheNamespace = opts.cacheNamespace ?? "";
+    this.audit = opts.audit;
     if (opts.impressions?.dedupe) {
       this.exposureTracker = createExposureTracker(opts.impressions.dedupe);
     }
@@ -249,6 +255,7 @@ export class FlagManager {
 
     await this.runMutationHook("flag.created", input.key, input.actor);
     const flag = await this.db.createFlag(input);
+    this.writeAudit("flag.created", input.key, input.actor);
     await this.bustCache(input.key);
     this.emit({ flagKey: input.key, action: "created" });
     this.webhookDispatcher.dispatch("flag.created", input.key, { flag });
@@ -1110,6 +1117,23 @@ export class FlagManager {
     await this.db.forgetUser(userId, scope);
   }
 
+  /**
+   * Return all flag evaluation impressions for a specific user.
+   * Implements GDPR right-to-explanation — callers can see which flags
+   * affected a user, what value they received, and when.
+   */
+  async getUserImpressions(
+    userId: string,
+    opts?: { limit?: number; flagKey?: string }
+  ): Promise<Array<{ flagKey: string; userId: string; value: unknown; variant: string | null; reason: string; at: Date }>> {
+    if (this.db.getUserImpressions) {
+      return this.db.getUserImpressions(userId, opts);
+    }
+    // Fallback: not supported by adapter
+    this.logger.warn("getUserImpressions not supported by adapter — returning empty array");
+    return [];
+  }
+
   // ── Scheduled Releases ───────────────────────────────────────────────
 
   async trackEvent(event: TrackEventInput): Promise<TrackingEvent | void> {
@@ -1592,11 +1616,15 @@ export class FlagManager {
   }
 
   private flagCacheKey(key: string): string {
-    return `rollease:flag:${key}`;
+    return this.cacheNamespace
+      ? `rollease:${this.cacheNamespace}:flag:${key}`
+      : `rollease:flag:${key}`;
   }
 
   private rulesCacheKey(key: string): string {
-    return `rollease:rules:${key}`;
+    return this.cacheNamespace
+      ? `rollease:${this.cacheNamespace}:rules:${key}`
+      : `rollease:rules:${key}`;
   }
 
   private async getFlagCached(key: string): Promise<Flag | null> {
@@ -1809,6 +1837,27 @@ export class FlagManager {
   ): Promise<void> {
     if (!this.hooks.onBeforeMutation) return;
     await this.hooks.onBeforeMutation({ action, flagKey, actor });
+  }
+
+  private writeAudit(action: HistoryAction, flagKey: string | undefined, actor: AuditActor | undefined): void {
+    if (!this.audit?.enabled || this.audit.sink === "db") return;
+    const event: import("../core/types").AuditEvent = {
+      id: `audit_${Date.now().toString(36)}`,
+      eventType: action,
+      actorId: typeof actor === "string" ? actor : actor?.id,
+      resource: flagKey,
+      action,
+      outcome: "success",
+      metadata: { actorName: actor?.name, actorType: actor?.type },
+      createdAt: new Date(),
+    };
+    if (this.audit.sink === "stdout") {
+      this.logger.info("audit", event as unknown as Record<string, unknown>);
+    } else if (this.audit.sink && typeof this.audit.sink === "object" && "write" in this.audit.sink) {
+      (this.audit.sink as import("../core/types").AuditSink).write(event).catch((err) =>
+        this.logger.warn("audit write failed", { err: errMessage(err) })
+      );
+    }
   }
 
   private async runBeforeEvaluation(

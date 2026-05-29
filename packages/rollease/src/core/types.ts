@@ -34,8 +34,6 @@ export interface RolleaseConfig {
   secret: string;
   /** Cache configuration */
   cache?: CacheConfig;
-  /** Audit logging configuration */
-  audit?: AuditConfig;
   /** L1 (in-process) cache TTL in milliseconds (default: 5000) */
   l1TtlMs?: number;
   /** Enable local developer overrides via .rolleaserc.json (default: true in dev) */
@@ -82,6 +80,33 @@ export interface RolleaseConfig {
    * the primary `db` adapter.
    */
   dbReader?: import("../db/adapter").DbAdapter;
+  /**
+   * Namespace prefix added to all L1/L2 cache keys.
+   * Set this to `tenantId` when using `createTenantAdapter` with a shared
+   * Redis cache to prevent cross-tenant cache collisions.
+   * Example: `"acme"` → cache keys become `rollease:acme:flag:<key>`.
+   */
+  cacheNamespace?: string;
+  /**
+   * Audit logging configuration. When enabled, every flag mutation writes
+   * a structured AuditEvent to the configured sink.
+   * `"db"` uses the addHistory path (always on).
+   * `"stdout"` logs via the configured `logging.sink`.
+   * Pass an AuditSink object for custom destinations (Datadog, S3, etc.).
+   */
+  audit?: AuditConfig;
+  /**
+   * Signing key ring for SDK key rotation.
+   * The key matching `currentSigningKeyId` is used to sign new tokens.
+   * All keys in the ring are accepted for verification (allows gradual rotation).
+   * When omitted, the single `secret` field is used for both sign and verify.
+   */
+  signingKeys?: Array<{ kid: string; secret: string }>;
+  /**
+   * The `kid` from `signingKeys` to use for signing new tokens.
+   * Ignored when `signingKeys` is not provided.
+   */
+  currentSigningKeyId?: string;
 }
 
 export interface ResilienceConfig {

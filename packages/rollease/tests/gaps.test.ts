@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { FlagManager } from "../src/engine/manager";
 import { MemoryDbAdapter } from "../src/db/memory";
 import { noopLogger } from "../src/core/logger";
@@ -50,10 +50,13 @@ describe("Webhooks & Callback Listeners", () => {
   });
 
   it("delivers HTTP POST webhooks with signatures", async () => {
-    const mockFetch = vi.fn().mockImplementation(() =>
-      Promise.resolve({ ok: true, status: 200, statusText: "OK" })
-    );
-    vi.stubGlobal("fetch", mockFetch);
+    const calls: Array<[string, RequestInit]> = [];
+    const mockFetch = (url: string, init: RequestInit) => {
+      calls.push([url, init]);
+      return Promise.resolve({ ok: true, status: 200, statusText: "OK" } as Response);
+    };
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
 
     const { manager } = createTestManager({
       webhooks: [
@@ -72,9 +75,10 @@ describe("Webhooks & Callback Listeners", () => {
     });
 
     await new Promise((r) => setTimeout(r, 50));
+    globalThis.fetch = origFetch;
 
-    expect(mockFetch).toHaveBeenCalledTimes(1);
-    const [url, requestInit] = mockFetch.mock.calls[0] as [string, RequestInit];
+    expect(calls).toHaveLength(1);
+    const [url, requestInit] = calls[0];
     expect(url).toBe("https://example.com/webhook");
     expect(requestInit.method).toBe("POST");
     expect(requestInit.headers).toBeDefined();
@@ -86,8 +90,6 @@ describe("Webhooks & Callback Listeners", () => {
     const body = JSON.parse(requestInit.body as string) as WebhookPayload;
     expect(body.event).toBe("flag.created");
     expect(body.flagKey).toBe("http_webhook_test");
-
-    vi.unstubAllGlobals();
   });
 });
 

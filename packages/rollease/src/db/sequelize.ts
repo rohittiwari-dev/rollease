@@ -1069,6 +1069,82 @@ export class SequelizeDbAdapter implements DbAdapter {
     );
   }
 
+  async trackEvent(event: import("../core/types").TrackEventInput): Promise<import("../core/types").TrackingEvent> {
+    const models = await this.getModels();
+    const tracked: import("../core/types").TrackingEvent = {
+      id: this.genId("event"),
+      userId: event.userId,
+      anonymousId: event.anonymousId,
+      event: event.event,
+      value: event.value,
+      metadata: event.metadata,
+      context: event.context,
+      environment: (event.context as import("../core/types").FlagContext | undefined)?.environment,
+      createdAt: event.ts ? new Date(event.ts as string) : new Date(),
+    };
+    const eventModel = (models as Record<string, unknown>)["Event"] as { create(v: unknown): Promise<unknown> } | undefined;
+    if (eventModel) {
+      await eventModel.create(tracked);
+    }
+    return tracked;
+  }
+
+  async listTrackingEvents(filters?: { userId?: string; event?: string; limit?: number }): Promise<import("../core/types").TrackingEvent[]> {
+    const models = await this.getModels();
+    const eventModel = (models as Record<string, unknown>)["Event"] as { findAll(opts: unknown): Promise<unknown[]> } | undefined;
+    if (!eventModel) return [];
+    const where: Record<string, unknown> = {};
+    if (filters?.userId) where["userId"] = filters.userId;
+    if (filters?.event) where["event"] = filters.event;
+    const rows = await eventModel.findAll({ where });
+    const all = rows.map((r) => this.toTrackingEvent(r));
+    return filters?.limit ? all.slice(-filters.limit) : all;
+  }
+
+  async getUserImpressions(
+    userId: string,
+    opts?: { limit?: number; flagKey?: string }
+  ): Promise<Array<{ flagKey: string; userId: string; value: unknown; variant: string | null; reason: string; at: Date }>> {
+    const models = await this.getModels();
+    const where: Record<string, unknown> = { userId };
+    if (opts?.flagKey) where["flagKey"] = opts.flagKey;
+    const rows = await models.Impression.findAll({ where });
+    const all = rows.map((r: unknown) => {
+      const d = this.plain(r);
+      return {
+        flagKey: String(d.flagKey),
+        userId: String(d.userId),
+        value: d.value,
+        variant: d.variant === null || d.variant === undefined ? null : String(d.variant),
+        reason: String(d.reason),
+        at: new Date(String(d.at)),
+      };
+    });
+    return opts?.limit ? all.slice(-opts.limit) : all;
+  }
+
+  private toTrackingEvent(row: unknown): import("../core/types").TrackingEvent {
+    const d = this.plain(row);
+    return {
+      id: String(d.id),
+      userId: d.userId ? String(d.userId) : undefined,
+      anonymousId: d.anonymousId ? String(d.anonymousId) : undefined,
+      event: String(d.event),
+      value: d.value as number | undefined,
+      metadata: d.metadata as Record<string, unknown> | undefined,
+      context: d.context as import("../core/types").FlagContext | undefined,
+      environment: d.environment ? String(d.environment) : undefined,
+      createdAt: new Date(String(d.createdAt)),
+    };
+  }
+
+  private plain(row: unknown): Record<string, unknown> {
+    if (row && typeof row === "object" && "get" in row) {
+      return (row as { get(opts: { plain: boolean }): Record<string, unknown> }).get({ plain: true });
+    }
+    return row as Record<string, unknown>;
+  }
+
   async close(): Promise<void> {
     if (this.sequelize.close) {
       await this.sequelize.close();

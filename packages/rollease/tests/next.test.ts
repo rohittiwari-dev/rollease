@@ -300,10 +300,13 @@ describe("Next.js Integration", () => {
       // The legacy __rollease accessor must be absent on the new client.
       expect((rl as any).__rollease).toBeUndefined();
 
-      // The symbol-keyed getter is present and returns the secret.
+      // The symbol-keyed getter is present and returns the signing info.
       const getter = (rl as any)[INTERNAL_SECRET];
       expect(typeof getter).toBe("function");
-      expect(getter()).toBe(TEST_SECRET);
+      const info = getter();
+      // May return { secret, keyRing, currentKeyId } (new) or a plain string (legacy).
+      const secret = typeof info === "object" ? info.secret : info;
+      expect(secret).toBe(TEST_SECRET);
 
       // JSON.stringify must not leak the secret.
       const json = JSON.stringify(rl);

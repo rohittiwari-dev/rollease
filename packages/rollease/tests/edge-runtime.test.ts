@@ -13,11 +13,7 @@
 // overhead, and is sufficient to prove the runtime guards work.
 // ============================================================================
 
-import { describe, it, expect, vi, afterEach } from "vitest";
-
-afterEach(() => {
-  vi.unstubAllGlobals();
-});
+import { describe, it, expect } from "vitest";
 
 describe("Edge-runtime compatibility", () => {
   describe("rollease/next import", () => {
@@ -46,18 +42,18 @@ describe("Edge-runtime compatibility", () => {
       );
       _resetOverridesRuntimeCache();
 
-      const originalVersions = process.versions;
-      vi.stubGlobal("process", {
+      const originalProcess = globalThis.process;
+      // Simulate edge: process exists but versions.node is absent.
+      globalThis.process = {
         ...process,
         versions: { ...process.versions, node: undefined as unknown as string },
-      });
+      } as typeof process;
 
       try {
         const result = loadLocalOverrides(".rolleaserc.json");
         expect(result).toEqual({});
       } finally {
-        // Restore so other tests aren't affected.
-        vi.stubGlobal("process", { ...process, versions: originalVersions });
+        globalThis.process = originalProcess;
         _resetOverridesRuntimeCache();
       }
     });

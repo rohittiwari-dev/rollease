@@ -1019,6 +1019,70 @@ export class RepositoryDbAdapter implements DbAdapter {
     }
   }
 
+  async trackEvent(event: import("../core/types").TrackEventInput): Promise<import("../core/types").TrackingEvent> {
+    const repo = (this.repositories as Record<string, unknown>)["Event"] as RowRepository | undefined;
+    const tracked: import("../core/types").TrackingEvent = {
+      id: this.genId("event"),
+      userId: event.userId,
+      anonymousId: event.anonymousId,
+      event: event.event,
+      value: event.value,
+      metadata: event.metadata,
+      context: event.context,
+      environment: (event.context as import("../core/types").FlagContext | undefined)?.environment,
+      createdAt: event.ts ? new Date(event.ts as string) : new Date(),
+    };
+    if (repo) {
+      await repo.create({ ...tracked });
+    }
+    return tracked;
+  }
+
+  async listTrackingEvents(filters?: { userId?: string; event?: string; limit?: number }): Promise<import("../core/types").TrackingEvent[]> {
+    const repo = (this.repositories as Record<string, unknown>)["Event"] as RowRepository | undefined;
+    if (!repo) return [];
+    const where: Record<string, unknown> = {};
+    if (filters?.userId) where["userId"] = filters.userId;
+    if (filters?.event) where["event"] = filters.event;
+    const rows = await repo.findMany({ where });
+    const all = rows.map((r: unknown) => {
+      const d = plain(r);
+      return {
+        id: String(d.id),
+        userId: optionalString(d.userId),
+        anonymousId: optionalString(d.anonymousId),
+        event: String(d.event),
+        value: d.value as number | undefined,
+        metadata: d.metadata as Record<string, unknown> | undefined,
+        context: d.context as import("../core/types").FlagContext | undefined,
+        environment: optionalString(d.environment),
+        createdAt: date(d.createdAt),
+      };
+    });
+    return filters?.limit ? all.slice(-filters.limit) : all;
+  }
+
+  async getUserImpressions(
+    userId: string,
+    opts?: { limit?: number; flagKey?: string }
+  ): Promise<Array<{ flagKey: string; userId: string; value: unknown; variant: string | null; reason: string; at: Date }>> {
+    const where: Record<string, unknown> = { userId };
+    if (opts?.flagKey) where["flagKey"] = opts.flagKey;
+    const rows = await this.repositories.Impression.findMany({ where });
+    const all = rows.map((r) => {
+      const d = plain(r);
+      return {
+        flagKey: String(d.flagKey),
+        userId: String(d.userId),
+        value: d.value,
+        variant: d.variant === null || d.variant === undefined ? null : String(d.variant),
+        reason: String(d.reason),
+        at: date(d.at),
+      };
+    });
+    return opts?.limit ? all.slice(-opts.limit) : all;
+  }
+
   async close(): Promise<void> {
     await this.closeHandler?.();
   }

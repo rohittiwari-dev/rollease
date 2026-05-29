@@ -296,6 +296,23 @@ export function createRolleaseHandler(
     return (e as { message?: string }).message ?? "Internal error";
   }
 
+  function computeEtag(data: string): string {
+    let h = 5381;
+    for (let i = 0; i < data.length; i++) {
+      h = ((h << 5) + h) ^ data.charCodeAt(i);
+    }
+    return `"${(h >>> 0).toString(36)}"`;
+  }
+
+  function jsonWithEtag(data: unknown, status = 200): Response {
+    const body = JSON.stringify(data);
+    const etag = computeEtag(body);
+    return new Response(body, {
+      status,
+      headers: { "Content-Type": "application/json", ETag: etag, ...corsHeaders() },
+    });
+  }
+
   function safeErrMsg(e: unknown, fallback = "Internal server error"): string {
     // Only expose validation-class error messages to clients; mask internal details.
     const name = errName(e);
@@ -356,7 +373,17 @@ export function createRolleaseHandler(
       try {
         const keys = await getPublicKeys(access.config);
         const flags = await manager.evaluateAllDetailed(ctx, keys ? { keys } : undefined);
-        return json({ flags, ts: Date.now() });
+        const payload = { flags, ts: Date.now() };
+        const body = JSON.stringify(payload);
+        const etag = computeEtag(body);
+        const ifNoneMatch = req.headers.get("if-none-match");
+        if (ifNoneMatch && ifNoneMatch === etag) {
+          return new Response(null, { status: 304, headers: corsHeaders() });
+        }
+        return new Response(body, {
+          status: 200,
+          headers: { "Content-Type": "application/json", ETag: etag, ...corsHeaders() },
+        });
       } catch (e) {
         return err(errMsg(e), 500);
       }
@@ -827,6 +854,40 @@ export function createRolleaseHandler(
         return json(release);
       } catch (e) {
         return err(safeErrMsg(e), 400);
+      }
+    }
+
+    // ── Admin: user impressions / right-to-explanation ─────────────────────
+    // GET /admin/users/:userId/impressions
+    if (
+      parts[0] === "admin" && parts[1] === "users" &&
+      parts.length === 4 && parts[3] === "impressions" && method === "GET"
+    ) {
+      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      const userId = decodeURIComponent(parts[2]);
+      try {
+        const url = new URL(req.url);
+        const limit = Number(url.searchParams.get("limit")) || 100;
+        const flagKey = url.searchParams.get("flagKey") ?? undefined;
+        const impressions = await manager.getUserImpressions(userId, { limit, flagKey });
+        return json({ userId, impressions, ts: Date.now() });
+      } catch (e) {
+        return err(safeErrMsg(e), 500);
+      }
+    }
+
+    // ── OpenAPI spec (GET /openapi.json) ───────────────────────────────────
+    if (route === "openapi.json" && method === "GET") {
+      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      try {
+        const { generateOpenAPISpec } = await import("./core/openapi.js");
+        const spec = generateOpenAPISpec({ basePath });
+        return new Response(JSON.stringify(spec, null, 2), {
+          status: 200,
+          headers: { "Content-Type": "application/json", ...corsHeaders() },
+        });
+      } catch {
+        return err("OpenAPI spec generation failed", 500);
       }
     }
 

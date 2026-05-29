@@ -29,6 +29,8 @@ export default defineConfig({
     "db/drizzle": "src/db/drizzle.ts",
     "db/repository": "src/db/repository.ts",
     "db/cloudflare-kv": "src/db/cloudflare-kv.ts",
+    "db/vercel-kv": "src/db/vercel-kv.ts",
+    "db/deno-kv": "src/db/deno-kv.ts",
 
     // Core modules
     "core/types": "src/core/types.ts",
@@ -43,6 +45,7 @@ export default defineConfig({
     "core/exposure": "src/core/exposure.ts",
     "core/tenant": "src/core/tenant.ts",
     "core/replica": "src/core/replica.ts",
+    "core/experiment": "src/core/experiment.ts",
     telemetry: "src/core/telemetry.ts",
 
     // Engine

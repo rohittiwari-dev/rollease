@@ -146,6 +146,14 @@ function encodeContext(ctx: FlagContext): string {
   return Buffer.from(json).toString("base64");
 }
 
+function generateAnonymousId(): string {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) {
+    return `anon_${crypto.randomUUID()}`;
+  }
+  // Fallback for environments without crypto.randomUUID
+  return `anon_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+}
+
 const LS_KEY = "rollease:flags";
 
 // ── Factory ───────────────────────────────────────────────────────────────────
@@ -168,11 +176,28 @@ export function createRolleaseClient(
     onError,
   } = config;
 
+  // ── Anonymous ID ──────────────────────────────────────────────────────────
+  // Auto-generate a stable anonymous ID when no anonymousId is configured.
+  // Stored in localStorage (when available) so it persists across sessions.
+  let effectiveAnonId = anonymousId;
+  if (!effectiveAnonId && typeof localStorage !== "undefined") {
+    const anonKey = "rollease:anonid";
+    try {
+      effectiveAnonId = localStorage.getItem(anonKey) ?? undefined;
+      if (!effectiveAnonId) {
+        effectiveAnonId = generateAnonymousId();
+        localStorage.setItem(anonKey, effectiveAnonId);
+      }
+    } catch { /* quota exceeded or private browsing */ }
+  }
+  if (!effectiveAnonId) effectiveAnonId = generateAnonymousId(); // session-only fallback
+
   let currentContext: FlagContext = {};
   let detailedFlags: DetailedFlagMap = {};
   let readyResolve!: () => void;
   let readyReject!: (err: Error) => void;
   let isReady = false;
+  let lastEtag: string | null = null;
   const readyPromise = new Promise<void>((res, rej) => {
     readyResolve = res;
     readyReject = rej;
@@ -244,10 +269,14 @@ export function createRolleaseClient(
 
   async function buildHeaders(): Promise<Record<string, string>> {
     const ctx = await resolveContext();
-    currentContext = ctx;
+    // When no userId, include anonymousId as userId for stable bucketing.
+    const enrichedCtx: FlagContext = ctx.userId
+      ? ctx
+      : { ...ctx, userId: effectiveAnonId };
+    currentContext = enrichedCtx;
     const h: Record<string, string> = {
       "Content-Type": "application/json",
-      "X-Rollease-Context": encodeContext(ctx),
+      "X-Rollease-Context": encodeContext(enrichedCtx),
       ...extraHeaders,
     };
     if (clientKey) {
@@ -258,10 +287,14 @@ export function createRolleaseClient(
 
   async function fetchFlags(): Promise<void> {
     const headers = await buildHeaders();
+    if (lastEtag) headers["If-None-Match"] = lastEtag;
     const res = await fetch(`${baseUrl}/flags`, { headers });
+    if (res.status === 304) return; // Flags unchanged — keep current state
     if (!res.ok) {
       throw new Error(`Rollease: flags fetch failed (${res.status})`);
     }
+    const etag = res.headers.get("ETag");
+    if (etag) lastEtag = etag;
     const data = (await res.json()) as { flags: DetailedFlagMap };
     applyFlags(data.flags);
   }
@@ -413,7 +446,7 @@ export function createRolleaseClient(
     track(event: string, props?: { value?: number; metadata?: Record<string, unknown> }): void {
       eventQueue.push({
         userId: currentContext.userId,
-        anonymousId,
+        anonymousId: effectiveAnonId,
         event,
         ...props,
       });
