@@ -123,7 +123,7 @@ interface FlagResult<T = unknown> {
 ```
 
 `reason` tells you exactly which step of the pipeline produced the result:
-`kill_switch | disabled | expired | not_scheduled | override | assignment | rule_match | percentage | weighted_random | default`
+`kill_switch | disabled | expired | not_scheduled | prerequisite_not_met | exclusion_group_miss | exclusion_layer_not_found | override | assignment | rule_match | percentage | weighted_random | error_fallback | default`
 
 ---
 
@@ -192,6 +192,8 @@ Step 7: Targeting rules       → sorted by priority, first match wins → rule_
 Step 8: Percentage rollout    → bucket(userId, flagKey) < pct? → percentage / weighted_random
 Step 9: Default               → return defaultValue
 ```
+
+> **Prerequisites & exclusion layers.** Two additional gates run inside the pipeline. A flag with `prerequisites` short-circuits to `prerequisite_not_met` when any prerequisite flag isn't satisfied (`FlagManager` resolves prerequisites recursively and cycle-safe before calling `evaluateFlag`). A flag attached to an `exclusionLayer` returns `exclusion_group_miss` when the user's bucket falls outside the flag's allocation in that layer (`exclusion_layer_not_found` if the referenced layer is missing). `error_fallback` is returned when `resilience.fallbackOnError` is enabled and evaluation throws.
 
 ### Bucketing
 
@@ -287,13 +289,15 @@ Cache keys use `rollease:flag:<key>` for individual flags and `rollease:all` for
 
 On any write operation (update, archive, kill, addRule, setRollout, deployRelease, etc.) the SDK busts the relevant cache keys automatically.
 
-> **Known issue:** Cache is busted on writes but reads don't populate the cache. The `evaluate()` path always goes to the DB. See [Issue #1 in section 15](#15-issues-found--recommended-fixes).
+> **Read-through caching:** `evaluate()` reads through L1 → L2 → DB via `getFlagCached()` / `getRulesCached()`, populating each tier on a miss. A miss for a nonexistent key is briefly negative-cached to avoid hammering the DB. Writes bust the relevant keys (and broadcast over the optional `InvalidationBus` for multi-process coherence).
 
 ---
 
 ## 7. Client-Server Communication Model
 
 This is the most important concept to understand for correct SDK usage.
+
+> This section covers the **Next.js signed-transport** model (middleware → RSC). For the **browser client over the internal REST API** (`createRolleaseClient` ↔ `createHandler()`, with SSE and analytics) — the pattern for SPAs and live updates — see the dedicated **[Client & Server](client-server.md)** guide.
 
 ### The core boundary
 
@@ -576,11 +580,14 @@ export default function Dashboard({ flags }) {
 
 ## 9. React Integration
 
+> Using **Vue, Svelte, or Angular**? Each has an equivalent client binding (plugin / store / signals) — see [Framework Integrations](frameworks.md). The rest of this section covers React.
+
 ### Provider
 
-Wrap your app (or a subtree) with `RolleaseProvider`. Pass either:
-- A `FlagMap` (key → value) from `evaluateAll()`
-- A `DetailedFlagMap` (key → FlagResult) from `evaluateAllDetailed()`
+Wrap your app (or a subtree) with `RolleaseProvider`. Supply one of:
+- `client` — a live `RolleaseBrowserClient` from `rollease/client` (real-time SSE/polling; preferred with `createHandler()` — see [Client & Server](client-server.md))
+- `initialFlags` — a `FlagMap` from `evaluateAll()` or a `DetailedFlagMap` from `evaluateAllDetailed()` (static SSR hydration)
+- `flagsUrl` (+ `refreshInterval`) — provider fetches and polls this URL
 
 ```tsx
 import { RolleaseProvider } from 'rollease/react'
@@ -682,17 +689,23 @@ await rl.flags.restoreAll({})
 
 ### Flag locking
 
-Lock a flag to prevent any modifications:
+Lock a flag with `setLock()` to block edits to its definition, rules, and rollout. Passing `locked`/`lockedReason` to `update()` is **deprecated and silently stripped** — always go through `setLock()` so the lock change is authorized and audited.
 
 ```ts
-await rl.flags.update('critical_flag', {
+await rl.flags.setLock('critical_flag', {
   locked: true,
-  lockedReason: 'audit requirement — contact compliance before changing',
+  reason: 'audit requirement — contact compliance before changing',
+  actor: { id: 'compliance-bot', type: 'service' },
 })
 
-// Any attempt to modify throws FlagLockedError (HTTP 423)
+// Edits to definition / rules / rollout now throw FlagLockedError (HTTP 423)
 await rl.flags.addRule('critical_flag', rule)  // ← throws FlagLockedError
+
+// Unlock
+await rl.flags.setLock('critical_flag', { locked: false })
 ```
+
+> `kill()`, `restore()`, `archive()`, `delete()`, and `clone()` are **not** blocked by a lock — locking guards configuration edits, not the emergency kill switch.
 
 ---
 
@@ -1464,172 +1477,45 @@ This section tracks issues discovered during development. All items have been re
 
 ---
 
-## 16. What More Can Be Done
+## 16. Roadmap & Cross-References
 
-### A. Client-side fetch API (for SPAs without SSR)
+Several capabilities listed as "future work" in early drafts of this guide have since **shipped**. They each have a dedicated guide:
 
-Currently Rollease has no answer for SPAs (Create React App, Vite) that don't use Next.js. Add:
+| Capability | Status | Where |
+|------------|--------|-------|
+| **Universal HTTP handler / Admin REST API** | ✅ Shipped | `rl.createHandler()` — see [HTTP API Reference](http-api.md) |
+| **Browser client SDK (SPAs without SSR)** | ✅ Shipped | `createRolleaseClient()` (`rollease/client`) — see [Client & Server](client-server.md) |
+| **Real-time updates (SSE)** | ✅ Shipped | `GET /api/rollease/flags/stream` + `rl.flags.onChange()` |
+| **Cross-process cache invalidation (pub/sub)** | ✅ Shipped | `config.invalidation` with `RedisInvalidationBus` |
+| **Impression tracking in the eval path** | ✅ Shipped | Automatic; configure via `config.impressions` |
+| **OpenTelemetry tracing** | ✅ Shipped | `config.telemetry` + `createOtelAdapter()` — see [Observability](observability.md) |
+| **Prometheus metrics** | ✅ Shipped | `config.metrics` + `createPrometheusAdapter()` — see [Observability](observability.md) |
+| **RBAC for management APIs** | ✅ Shipped | `createDefaultRBACPolicy` / `createRBACHook` — see [RBAC](rbac.md) |
+| **Per-environment default values** | ✅ Shipped | `environmentDefaults` on `create()` / `update()` |
+| **OpenFeature provider** | ✅ Shipped | `createRolleaseProvider()` — see [OpenFeature](openfeature.md) |
+| **Config export / diff / promote** | ✅ Shipped | `rollease/sync` — see [Configuration Sync](sync.md) |
+| **A/B stats (p-values, CIs, bandits)** | ✅ Shipped | `rollease/stats` — see [Statistics Engine](stats.md) |
+| **Cloudflare KV / D1 adapters** | ✅ Shipped | `rollease/db/cloudflare-kv`, `rollease/db/cloudflare-d1` — see [Cloudflare](cloudflare.md) |
 
-```ts
-// rollease/client — a browser-only package
-import { createClientRollease } from 'rollease/client'
-
-const rl = createClientRollease({
-  endpoint: '/api/flags',  // your API route that calls server SDK
-  context: { userId: currentUser.id },
-  refreshInterval: 30_000,  // re-fetch every 30s
-})
-
-// Fetches /api/flags?userId=... and hydrates context
-await rl.ready()
-const { enabled } = rl.flag('new_checkout')
-```
-
-Pair with a Next.js route handler helper:
-
-```ts
-// app/api/flags/route.ts
-import { createFlagsRoute } from 'rollease/next'
-import { rl } from '@/lib/rollease'
-
-export const GET = createFlagsRoute(rl, {
-  context: (req) => ({ userId: req.headers.get('x-user-id') ?? undefined }),
-  // Optional: return only specific namespaces
-  namespace: 'ui',
-})
-```
-
-### B. Real-time flag updates (SSE or WebSocket)
-
-Currently, flag changes don't propagate to running instances. Add a pub/sub channel:
+### Real-time updates — current shape
 
 ```ts
-// When any flag changes, publish to Redis pub/sub
-await rl.flags.kill('my_flag')
-// → publishes { type: 'flag.killed', key: 'my_flag' } to Redis channel 'rollease:changes'
+// Server: any mutation fires onChange (in-process) and, when an
+// InvalidationBus is configured, propagates to other replicas.
+const unsubscribe = rl.flags.onChange((e) => console.log(e.action, e.flagKey))
 
-// Each server instance subscribes
-rl.flags.subscribe()  // listens to Redis pub/sub and busts local L1 cache
-
-// Browser: SSE endpoint that forwards flag changes
-// GET /api/flags/stream → EventSource
-```
-
-### C. Admin REST API helper
-
-A pre-built route handler for flag management (no custom API needed):
-
-```ts
-// app/api/rollease/[...route]/route.ts
-import { createAdminRouter } from 'rollease/next'
-import { rl } from '@/lib/rollease'
-
-export const { GET, POST, PATCH, DELETE } = createAdminRouter(rl, {
-  auth: (req) => isAdmin(req),  // guard all admin operations
-})
-```
-
-Would expose: `GET /api/rollease/flags`, `POST /api/rollease/flags`, `PATCH /api/rollease/flags/:key`, etc.
-
-### D. Impression tracking in evaluation path
-
-The `DbAdapter` has an optional `trackImpression()` method but `FlagManager.evaluate()` never calls it. Wire it up:
-
-```ts
-private async evaluate<T>(key: string, context: FlagContext): Promise<FlagResult<T>> {
-  const result = evaluateFlag(...)
-  
-  // Fire-and-forget impression tracking
-  if (context.userId && this.db.trackImpression) {
-    this.db.trackImpression({
-      flagKey: key,
-      userId: context.userId,
-      value: result.value,
-      variant: result.variant,
-      reason: result.reason,
-    }).catch(() => {}) // never let tracking fail an evaluation
-  }
-  
-  return result
+// Browser: subscribe to the SSE endpoint exposed by the handler.
+const es = new EventSource('/api/rollease/flags/stream')
+es.onmessage = (msg) => {
+  const { flags } = JSON.parse(msg.data) // re-pushed on every change
 }
 ```
 
-### E. GeoIP integration
+### Still on the roadmap
 
-The types already define `GeoIPAdapter` and `GeoContext`. Wire it into the evaluation context:
-
-```ts
-const rl = createRollease({
-  db,
-  secret,
-  geoip: myGeoIPAdapter,  // resolves IP → { country, region, city }
-})
-
-// Before evaluation, middleware auto-resolves IP
-const geoCtx = await geoip.resolve(req.ip)
-context.region = geoCtx?.country?.toLowerCase()
-context.attributes = { ...context.attributes, city: geoCtx?.city }
-```
-
-### F. `useFlag` with async client-side fetching
-
-Currently `useFlag` always returns `loading: false` because flags are assumed to be pre-loaded. Add a version that supports lazy fetching for flags not included in the initial set:
-
-```tsx
-const { enabled, loading } = useFlag('rarely_used_flag', {
-  fetch: true,  // fetch from /api/flags/rarely_used_flag if not in context
-})
-```
-
-### G. Variant experiments with analytics
-
-Add a built-in experiment helper that auto-tracks exposures and integrates with analytics:
-
-```ts
-import { useExperiment } from 'rollease/react'
-
-const { variant, track } = useExperiment('exp.pricing')
-// variant → 'variant_b'
-
-// On conversion
-track('purchase', { amount: 49.99 })
-// → sends { flagKey: 'exp.pricing', variant: 'variant_b', event: 'purchase', amount: 49.99 }
-```
-
-### H. CLI tool for flag management
-
-```bash
-npx rollease flags list
-npx rollease flags create --key new_checkout --type boolean --default false
-npx rollease flags kill new_checkout
-npx rollease releases deploy <release-id>
-```
-
-### I. OpenTelemetry integration
-
-Add spans to the evaluation pipeline:
-
-```ts
-// Each evaluateFlag() call creates an OTel span with attributes:
-// rollease.flag.key, rollease.flag.type, rollease.eval.reason, rollease.eval.variant
-```
-
-### J. Multi-environment config in one flag
-
-Currently `environments` is just a filter array. Add per-environment default values:
-
-```ts
-await rl.flags.create({
-  key: 'new_checkout',
-  type: 'boolean',
-  defaultValue: false,
-  environmentDefaults: {
-    development: true,
-    staging: true,
-    production: false,
-  },
-})
-```
+- **Built-in GeoIP auto-resolution.** `GeoIPAdapter`/`GeoContext` types exist; today you resolve IP → region inside an `onBeforeEvaluation` hook. A first-class `config.geoip` that auto-enriches context is not yet wired.
+- **`useExperiment` React hook.** Server-side experiment plumbing ships as `createExperimentHooks` + `config.analyticsSink`; a React `useExperiment(key)` convenience hook that auto-tracks exposure/conversion is still planned.
+- **CLI (`npx rollease …`).** Flag management from the terminal is not yet built — use the HTTP API or call `rl.flags.*` from a script.
 
 ---
 

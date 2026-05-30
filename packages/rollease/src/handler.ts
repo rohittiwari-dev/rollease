@@ -94,10 +94,76 @@ export interface RolleaseHandlerOptions {
    * Return true to allow; false to reject with 401.
    */
   healthAuth?: (req: Request) => boolean | Promise<boolean>;
+
+  /**
+   * Restrict admin (write) endpoints to a fixed set of client IPs / CIDR
+   * ranges. When provided, requests from IPs not on the list receive 403
+   * before `adminAuth` even runs. CIDR notation is supported for IPv4 only
+   * (e.g. `"10.0.0.0/8"`). Single IPs match literally.
+   *
+   * The client IP is read from these headers in order:
+   *   `cf-connecting-ip`, `x-real-ip`, `x-forwarded-for` (first entry).
+   * Falls back to allowing the request only when no proxy header is present
+   * AND the allowlist is configured to permit local development (omit this
+   * option in production).
+   */
+  adminIPAllowlist?: string[];
+
+  /**
+   * Override how the client IP is extracted from the request. Useful for
+   * custom proxy header schemes (e.g. AWS ALB's `x-amzn-trace-id`).
+   * Defaults to checking cf-connecting-ip → x-real-ip → x-forwarded-for.
+   */
+  getClientIP?: (req: Request) => string | undefined;
 }
 
 /** A fetch-compatible Rollease HTTP handler.  Pass directly as a Next.js route handler. */
 export type RolleaseHandler = (req: Request) => Promise<Response>;
+
+// ── IP matchers ──────────────────────────────────────────────────────────────
+
+type IPMatcher = (ip: string) => boolean;
+
+/**
+ * Compile a single allowlist entry (literal IP or CIDR) into a predicate.
+ * IPv4 CIDR is parsed; IPv6 and anything unparseable falls back to exact match.
+ */
+function compileIPMatcher(entry: string): IPMatcher {
+  const trimmed = entry.trim();
+  const slash = trimmed.indexOf("/");
+  if (slash < 0) {
+    return (ip) => ip === trimmed;
+  }
+  const baseStr = trimmed.slice(0, slash);
+  const maskBits = Number(trimmed.slice(slash + 1));
+  const baseInt = ipv4ToInt(baseStr);
+  if (baseInt === null || !Number.isFinite(maskBits) || maskBits < 0 || maskBits > 32) {
+    // Unparseable CIDR — fall back to literal match so we never silently
+    // open up an allowlist due to a typo.
+    return (ip) => ip === trimmed;
+  }
+  // Build mask as an unsigned 32-bit integer.
+  const mask = maskBits === 0 ? 0 : (~0 << (32 - maskBits)) >>> 0;
+  const network = (baseInt & mask) >>> 0;
+  return (ip) => {
+    const ipInt = ipv4ToInt(ip);
+    if (ipInt === null) return false;
+    return ((ipInt & mask) >>> 0) === network;
+  };
+}
+
+function ipv4ToInt(ip: string): number | null {
+  const parts = ip.split(".");
+  if (parts.length !== 4) return null;
+  let result = 0;
+  for (const part of parts) {
+    if (!/^\d+$/.test(part)) return null;
+    const n = Number(part);
+    if (n < 0 || n > 255) return null;
+    result = ((result << 8) | n) >>> 0;
+  }
+  return result >>> 0;
+}
 
 // ── Factory ──────────────────────────────────────────────────────────────────
 
@@ -113,7 +179,13 @@ export function createRolleaseHandler(
     cors = "*",
     clientKeys,
     healthAuth,
+    adminIPAllowlist,
+    getClientIP,
   } = options;
+
+  // Pre-compile the allowlist into matcher functions so we don't reparse
+  // CIDR ranges on every admin request.
+  const ipMatchers = adminIPAllowlist ? adminIPAllowlist.map(compileIPMatcher) : null;
 
   const enc = new TextEncoder();
 
@@ -184,12 +256,40 @@ export function createRolleaseHandler(
     return {};
   }
 
-  async function checkAdmin(req: Request): Promise<boolean> {
-    if (!adminAuth) return false;
+  function readClientIP(req: Request): string | undefined {
+    if (getClientIP) {
+      try {
+        return getClientIP(req);
+      } catch {
+        // fall through to header probing
+      }
+    }
+    const cf = req.headers.get("cf-connecting-ip");
+    if (cf) return cf.trim();
+    const real = req.headers.get("x-real-ip");
+    if (real) return real.trim();
+    const fwd = req.headers.get("x-forwarded-for");
+    if (fwd) return fwd.split(",")[0]?.trim();
+    return undefined;
+  }
+
+  function isIPAllowed(req: Request): boolean {
+    if (!ipMatchers) return true;
+    const ip = readClientIP(req);
+    if (!ip) return false; // Fail closed when allowlist is configured but IP missing
+    return ipMatchers.some((m) => m(ip));
+  }
+
+  async function checkAdmin(req: Request): Promise<{ ok: boolean; status?: number; reason?: string }> {
+    if (!isIPAllowed(req)) {
+      return { ok: false, status: 403, reason: "IP not allowlisted" };
+    }
+    if (!adminAuth) return { ok: false, status: 401, reason: "Unauthorized" };
     try {
-      return await adminAuth(req);
+      const allowed = await adminAuth(req);
+      return allowed ? { ok: true } : { ok: false, status: 401, reason: "Unauthorized" };
     } catch {
-      return false;
+      return { ok: false, status: 401, reason: "Unauthorized" };
     }
   }
 
@@ -354,7 +454,7 @@ export function createRolleaseHandler(
 
     // ── Prometheus Metrics (GET /metrics) ──────────────────────────────────
     if (route === "metrics" && method === "GET") {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       const body = manager.getMetrics();
       return new Response(body, {
         status: 200,
@@ -489,7 +589,7 @@ export function createRolleaseHandler(
 
     // ── Admin: list flags (GET /admin/flags) ───────────────────────────────
     if (route === "admin/flags" && method === "GET") {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       try {
         const url = new URL(req.url);
         const ns = url.searchParams.get("namespace") ?? undefined;
@@ -506,7 +606,7 @@ export function createRolleaseHandler(
 
     // ── Admin: create flag (POST /admin/flags) ─────────────────────────────
     if (route === "admin/flags" && method === "POST") {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       try {
         const body = await req.json();
         const actor = await resolveActor(req);
@@ -519,7 +619,7 @@ export function createRolleaseHandler(
 
     // ── Admin: get flag (GET /admin/flags/:key) ────────────────────────────
     if (parts[0] === "admin" && parts[1] === "flags" && parts.length === 3 && method === "GET") {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       const key = decodeURIComponent(parts[2]);
       try {
         const flag = await manager.get(key);
@@ -533,7 +633,7 @@ export function createRolleaseHandler(
 
     // ── Admin: update flag (PATCH /admin/flags/:key) ───────────────────────
     if (parts[0] === "admin" && parts[1] === "flags" && parts.length === 3 && method === "PATCH") {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       const key = decodeURIComponent(parts[2]);
       try {
         const body = await req.json();
@@ -547,7 +647,7 @@ export function createRolleaseHandler(
 
     // ── Admin: archive flag (DELETE /admin/flags/:key) ─────────────────────
     if (parts[0] === "admin" && parts[1] === "flags" && parts.length === 3 && method === "DELETE") {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       const key = decodeURIComponent(parts[2]);
       try {
         const actor = await resolveActor(req);
@@ -563,7 +663,7 @@ export function createRolleaseHandler(
       parts[0] === "admin" && parts[1] === "flags" &&
       parts.length === 4 && parts[3] === "kill" && method === "POST"
     ) {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       const key = decodeURIComponent(parts[2]);
       try {
         const body = await req.json().catch(() => ({}));
@@ -580,7 +680,7 @@ export function createRolleaseHandler(
       parts[0] === "admin" && parts[1] === "flags" &&
       parts.length === 4 && parts[3] === "restore" && method === "POST"
     ) {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       const key = decodeURIComponent(parts[2]);
       try {
         const body = await req.json().catch(() => ({}));
@@ -597,7 +697,7 @@ export function createRolleaseHandler(
       parts[0] === "admin" && parts[1] === "flags" &&
       parts.length === 4 && parts[3] === "lock" && method === "POST"
     ) {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       const key = decodeURIComponent(parts[2]);
       try {
         const body = await req.json().catch(() => ({}));
@@ -614,7 +714,7 @@ export function createRolleaseHandler(
       parts[0] === "admin" && parts[1] === "flags" &&
       parts.length === 4 && parts[3] === "history" && method === "GET"
     ) {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       const key = decodeURIComponent(parts[2]);
       try {
         const history = await manager.getHistory(key);
@@ -629,7 +729,7 @@ export function createRolleaseHandler(
       parts[0] === "admin" && parts[1] === "flags" &&
       parts.length === 4 && parts[3] === "rules" && method === "GET"
     ) {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       const key = decodeURIComponent(parts[2]);
       try {
         const rules = await manager.listRules(key);
@@ -644,7 +744,7 @@ export function createRolleaseHandler(
       parts[0] === "admin" && parts[1] === "flags" &&
       parts.length === 4 && parts[3] === "rules" && method === "POST"
     ) {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       const key = decodeURIComponent(parts[2]);
       try {
         const body = await req.json();
@@ -661,7 +761,7 @@ export function createRolleaseHandler(
       parts[0] === "admin" && parts[1] === "flags" &&
       parts.length === 5 && parts[3] === "rules" && method === "PATCH"
     ) {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       const key = decodeURIComponent(parts[2]);
       const ruleId = decodeURIComponent(parts[4]);
       try {
@@ -679,7 +779,7 @@ export function createRolleaseHandler(
       parts[0] === "admin" && parts[1] === "flags" &&
       parts.length === 5 && parts[3] === "rules" && method === "DELETE"
     ) {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       const key = decodeURIComponent(parts[2]);
       const ruleId = decodeURIComponent(parts[4]);
       try {
@@ -696,7 +796,7 @@ export function createRolleaseHandler(
       parts[0] === "admin" && parts[1] === "flags" &&
       parts.length === 4 && parts[3] === "rollout" && method === "POST"
     ) {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       const key = decodeURIComponent(parts[2]);
       try {
         const body = await req.json();
@@ -710,7 +810,7 @@ export function createRolleaseHandler(
 
     // ── Admin: list segments (GET /admin/segments) ─────────────────────────
     if (route === "admin/segments" && method === "GET") {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       try {
         const segments = await manager.listSegments();
         return json({ segments, ts: Date.now() });
@@ -721,7 +821,7 @@ export function createRolleaseHandler(
 
     // ── Admin: create segment (POST /admin/segments) ───────────────────────
     if (route === "admin/segments" && method === "POST") {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       try {
         const body = await req.json();
         const actor = await resolveActor(req);
@@ -734,7 +834,7 @@ export function createRolleaseHandler(
 
     // ── Admin: update segment (PATCH /admin/segments/:key) ─────────────────
     if (parts[0] === "admin" && parts[1] === "segments" && parts.length === 3 && method === "PATCH") {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       const key = decodeURIComponent(parts[2]);
       try {
         const body = await req.json();
@@ -748,7 +848,7 @@ export function createRolleaseHandler(
 
     // ── Admin: delete segment (DELETE /admin/segments/:key) ────────────────
     if (parts[0] === "admin" && parts[1] === "segments" && parts.length === 3 && method === "DELETE") {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       const key = decodeURIComponent(parts[2]);
       try {
         const actor = await resolveActor(req);
@@ -761,7 +861,7 @@ export function createRolleaseHandler(
 
     // ── Admin: list releases (GET /admin/releases) ─────────────────────────
     if (route === "admin/releases" && method === "GET") {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       try {
         const url = new URL(req.url);
         const environment = url.searchParams.get("environment") ?? undefined;
@@ -776,7 +876,7 @@ export function createRolleaseHandler(
 
     // ── Admin: create release (POST /admin/releases) ───────────────────────
     if (route === "admin/releases" && method === "POST") {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       try {
         const body = await req.json();
         const actor = await resolveActor(req);
@@ -792,7 +892,7 @@ export function createRolleaseHandler(
       parts[0] === "admin" && parts[1] === "releases" &&
       parts.length === 4 && parts[3] === "deploy" && method === "POST"
     ) {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       const releaseId = decodeURIComponent(parts[2]);
       try {
         const body = await req.json().catch(() => ({}));
@@ -809,7 +909,7 @@ export function createRolleaseHandler(
       parts[0] === "admin" && parts[1] === "releases" &&
       parts.length === 4 && parts[3] === "rollback" && method === "POST"
     ) {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       const releaseId = decodeURIComponent(parts[2]);
       try {
         const body = await req.json().catch(() => ({}));
@@ -826,7 +926,7 @@ export function createRolleaseHandler(
       parts[0] === "admin" && parts[1] === "releases" &&
       parts.length === 4 && parts[3] === "approve" && method === "POST"
     ) {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       const releaseId = decodeURIComponent(parts[2]);
       try {
         const body = await req.json().catch(() => ({}));
@@ -844,7 +944,7 @@ export function createRolleaseHandler(
       parts[0] === "admin" && parts[1] === "releases" &&
       parts.length === 4 && parts[3] === "reject" && method === "POST"
     ) {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       const releaseId = decodeURIComponent(parts[2]);
       try {
         const body = await req.json().catch(() => ({}));
@@ -863,7 +963,7 @@ export function createRolleaseHandler(
       parts[0] === "admin" && parts[1] === "users" &&
       parts.length === 4 && parts[3] === "impressions" && method === "GET"
     ) {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       const userId = decodeURIComponent(parts[2]);
       try {
         const url = new URL(req.url);
@@ -878,7 +978,7 @@ export function createRolleaseHandler(
 
     // ── OpenAPI spec (GET /openapi.json) ───────────────────────────────────
     if (route === "openapi.json" && method === "GET") {
-      if (!(await checkAdmin(req))) return err("Unauthorized", 401);
+      { const admin = await checkAdmin(req); if (!admin.ok) return err(admin.reason!, admin.status!); }
       try {
         const { generateOpenAPISpec } = await import("./core/openapi.js");
         const spec = generateOpenAPISpec({ basePath });

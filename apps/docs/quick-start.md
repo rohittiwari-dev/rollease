@@ -189,8 +189,17 @@ These overrides bypass all rules and rollouts during development. Add to `.gitig
 | Guide | What you'll learn |
 |-------|-------------------|
 | [Developer Guide](developer-guide.md) | Full architecture, Next.js integration, all features |
-| [API Reference](api-reference.md) | Every method, parameter, and return type |
+| [API Reference](api-reference.md) | Every `rl.flags.*` method, parameter, and return type |
+| [HTTP API Reference](http-api.md) | REST routes from `rl.createHandler()` + the auth model |
+| [Client & Server](client-server.md) | Browser client (`rollease/client`) ↔ server, React live updates |
+| [Framework Integrations](frameworks.md) | Vue, Svelte, and Angular bindings |
+| [RBAC](rbac.md) | Roles, permissions, and gating the management APIs |
 | [Error Handling](error-handling.md) | Error classes, best practices, API route patterns |
+| [Observability](observability.md) | Prometheus metrics, OpenTelemetry, audit log, health, webhooks |
+| [OpenFeature](openfeature.md) | Use Rollease as an OpenFeature provider |
+| [Configuration Sync](sync.md) | Export / diff / promote flags across environments |
+| [Statistics Engine](stats.md) | A/B test analysis — p-values, CIs, sample size, bandits |
+| [Cloudflare Workers](cloudflare.md) | KV / D1 adapters + handler on the edge |
 | [Testing Guide](testing-guide.md) | Unit testing, React testing, mock patterns |
 | [Architecture](architecture.md) | Internal design, evaluation pipeline, security model |
 | [Prisma & Drizzle Examples](prisma-drizzle-examples.md) | ORM adapter setup |

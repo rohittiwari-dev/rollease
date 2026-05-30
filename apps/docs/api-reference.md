@@ -2,7 +2,9 @@
 
 > **Package:** `rollease`  
 > **Version:** 0.0.0-alpha.0  
-> **Last updated:** 2026-05-27
+> **Last updated:** 2026-05-30
+
+This reference covers the **programmatic** (`rl.flags.*`) API. For the **REST/HTTP** surface exposed by `rl.createHandler()` (evaluation + admin routes, RBAC, client keys), see the **[HTTP API Reference](http-api.md)**.
 
 ---
 
@@ -19,14 +21,17 @@
 9. [FlagManager — Tags](#flagmanager--tags)
 10. [FlagManager — History & Audit](#flagmanager--history--audit)
 11. [FlagManager — Cache](#flagmanager--cache)
-12. [FlagManager — Events](#flagmanager--events)
-13. [evaluateFlag() — Pure Evaluation](#evaluateflag--pure-evaluation)
-14. [Bucketing — getBucket() & murmurhash3_32()](#bucketing)
-15. [Security Utilities](#security-utilities)
-16. [Logger](#logger)
-17. [Local Overrides](#local-overrides)
-18. [React Integration](#react-integration)
-19. [Next.js Integration](#nextjs-integration)
+12. [FlagManager — Events, trackEvent & Bulk Operations](#flagmanager--events)
+13. [FlagManager — Exclusion Layers](#flagmanager--exclusion-layers)
+14. [FlagManager — Privacy & GDPR](#flagmanager--privacy--gdpr)
+15. [FlagManager — Health & Metrics](#flagmanager--health--metrics)
+16. [evaluateFlag() — Pure Evaluation](#evaluateflag--pure-evaluation)
+17. [Bucketing — getBucket() & murmurhash3_32()](#bucketing)
+18. [Security Utilities](#security-utilities)
+19. [Logger](#logger)
+20. [Local Overrides](#local-overrides)
+21. [React Integration](#react-integration)
+22. [Next.js Integration](#nextjs-integration)
 
 ---
 
@@ -61,15 +66,34 @@ function createRollease(config: RolleaseConfig): RolleaseClient
 | `config.audit` | `AuditConfig` | — | Audit logging configuration |
 | `config.evaluateAllPageSize` | `number` | `1000` | Page size for bulk flag fetching |
 | `config.autoResolveSegments` | `boolean` | `false` | Auto-evaluate segment definitions against context at eval time |
+| `config.impressions.dedupe` | `{ windowMs?, maxEntries?, keyFields? }` | — | Suppress duplicate impressions for the same user+flag+value within a window |
+| `config.environment` | `string` | — | Default environment injected into every evaluation context and used for flag scoping |
+| `config.webhooks` | `WebhookConfig[]` | — | Outbound change webhooks (see [Observability](observability.md#6-change-log-webhooks)) |
+| `config.metrics` | `MetricsAdapter` | — | Metrics adapter — `createPrometheusAdapter()` or custom |
+| `config.telemetry` | `TelemetryAdapter` | — | OpenTelemetry/custom tracing — `createOtelAdapter(tracer)` |
+| `config.resilience` | `ResilienceConfig` | — | `fallbackOnError`, `retry`, `circuitBreaker` for DB ops |
+| `config.privacy` | `PrivacyConfig` | — | `privateAttributes` scrubbing + retention windows |
+| `config.invalidation` | `InvalidationBus` | — | Cross-process cache/SSE invalidation (e.g. `RedisInvalidationBus`) |
+| `config.dbReader` | `DbAdapter` | — | Read-replica adapter; evaluation reads use this, writes use `db` |
+| `config.cacheNamespace` | `string` | `''` | Prefix added to all cache keys (set to `tenantId` for shared-cache multi-tenancy) |
+| `config.signingKeys` | `Array<{ kid, secret }>` | — | Signing key ring for SDK key rotation |
+| `config.currentSigningKeyId` | `string` | — | `kid` from `signingKeys` used to sign new tokens |
+| `config.analyticsSink` | `AnalyticsSink` | — | Dual-write `trackEvent()` calls to Segment/Mixpanel/PostHog/etc. |
+
+> `config.cache` is optional — omit it to run L1-only (in-process). `config.localOverrides` defaults to `true` only when `NODE_ENV` is `development`/`dev`, otherwise `false`.
 
 ### Returns
 
 ```ts
 interface RolleaseClient {
-  flags: FlagManager       // All flag operations
-  close(): Promise<void>   // Graceful shutdown (closes DB + cache connections)
+  flags: FlagManager                  // All flag operations (the FlagManager API below)
+  health(): Promise<RolleaseHealthResult>           // DB/cache/circuit health + eval metrics
+  createHandler(options?: RolleaseHandlerOptions): RolleaseHandler  // fetch-compatible HTTP handler
+  close(): Promise<void>              // Graceful shutdown (closes DB + cache + invalidation bus)
 }
 ```
+
+> `createHandler()` builds the universal REST/HTTP handler (flag evaluation + admin management routes, with RBAC, client keys, CORS, IP allowlist). Its routes, auth model, and request/response shapes are documented in the **[HTTP API Reference](http-api.md)**.
 
 ### Example
 
@@ -179,7 +203,11 @@ const { key, value } = await rl.flags.getVariant('exp.pricing', {
 Full evaluation returning a `FlagResult` with all diagnostic fields.
 
 ```ts
-evaluate<T>(key: string, context: FlagContext): Promise<FlagResult<T>>
+evaluate<T>(
+  key: string,
+  context: FlagContext,
+  callOptions?: { trace?: boolean }
+): Promise<FlagResult<T>>
 ```
 
 **Returns:** `Promise<FlagResult<T>>`
@@ -193,7 +221,15 @@ interface FlagResult<T> {
   reason: EvalReason      // which pipeline step produced this result
   ruleId: string | null   // which rule matched (if any)
   evaluatedAt: Date       // timestamp of evaluation
+  trace?: EvaluationTrace // present only when called with { trace: true }
 }
+```
+
+Pass `{ trace: true }` to capture a step-by-step `EvaluationTrace` for debugging:
+
+```ts
+const result = await rl.flags.evaluate('new_checkout', { userId: 'u1' }, { trace: true })
+result.trace?.steps // [{ step, name, matched, detail }, ...]
 ```
 
 ```ts
@@ -215,14 +251,16 @@ Evaluate all active flags and return a flat key → value map.
 ```ts
 evaluateAll(
   context: FlagContext,
-  options?: { namespace?: string }
+  options?: { keys?: string[]; namespace?: string; tags?: string[] }
 ): Promise<FlagMap>
 ```
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `context` | `FlagContext` | Evaluation context |
+| `options.keys` | `string[]` | Restrict to these flag keys (empty array → `{}`) |
 | `options.namespace` | `string` | Filter to a specific namespace |
+| `options.tags` | `string[]` | Filter to flags carrying any of these tags |
 
 **Returns:** `Promise<Record<string, unknown>>`
 
@@ -243,9 +281,14 @@ Same as `evaluateAll` but returns full `FlagResult` objects.
 ```ts
 evaluateAllDetailed(
   context: FlagContext,
-  options?: { namespace?: string }
+  options?: { keys?: string[]; namespace?: string; tags?: string[]; trace?: boolean }
 ): Promise<DetailedFlagMap>
 ```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `options.keys` / `namespace` / `tags` | — | Same filters as `evaluateAll` |
+| `options.trace` | `boolean` | Attach an `EvaluationTrace` (`result.trace`) showing each pipeline step |
 
 **Returns:** `Promise<Record<string, FlagResult>>`
 
@@ -254,7 +297,34 @@ const detailed = await rl.flags.evaluateAllDetailed({ userId: 'u1' })
 // → { new_checkout: { key: 'new_checkout', value: true, reason: 'rule_match', ... } }
 ```
 
+> This is the method the HTTP handler's `GET /flags` route uses. Environment scoping and (when enabled) `autoResolveSegments` are applied once for the whole batch.
+
 ---
+
+### `evaluateMultiContext(key, multiContext)`
+
+Evaluate a single flag against multiple named contexts (e.g. `user` + `organization` + `device`), merged into one evaluation context. The `primaryKey` context's identity fields win; attributes and segments from all contexts are merged.
+
+```ts
+evaluateMultiContext<T>(key: string, multiContext: MultiContext): Promise<FlagResult<T>>
+
+interface MultiContext {
+  contexts: Record<string, FlagContext>
+  primaryKey?: string   // defaults to the first context key
+}
+```
+
+```ts
+const result = await rl.flags.evaluateMultiContext('new_dashboard', {
+  primaryKey: 'user',
+  contexts: {
+    user: { userId: 'u_alice', userType: 'beta' },
+    org:  { tenantId: 'acme', attributes: { plan: 'enterprise' } },
+  },
+})
+```
+
+**Throws:** `ValidationError` if `primaryKey` doesn't match any provided context.
 
 ## FlagManager — Flag CRUD
 
@@ -279,6 +349,10 @@ create(input: CreateFlagInput): Promise<Flag>
 | `rollout` | `RolloutConfig` | — | Initial rollout configuration |
 | `scheduledAt` | `string \| null` | — | ISO date — auto-activate at this time |
 | `expiresAt` | `string \| null` | — | ISO date — auto-deactivate after this time |
+| `prerequisites` | `FlagPrerequisite[]` | — | Other flags that must evaluate to a required `variation` first (validated for cycles) |
+| `environmentDefaults` | `Record<string, unknown>` | — | Per-environment default value overrides |
+| `exclusionLayer` | `string` | — | Mutual-exclusion layer key this flag belongs to |
+| `clientVisible` | `boolean` | — | Whether this flag may be exposed through public client keys |
 | `actor` | `AuditActor` | — | Who is creating the flag |
 
 **Throws:**
@@ -576,6 +650,8 @@ createRelease(input: CreateReleaseInput): Promise<Release>
 | `environment` | `string` | — | Target environment |
 | `changes` | `ReleaseChange[]` | ✅ | Array of flag changes |
 | `scheduledAt` | `string` | — | Schedule deployment for later |
+| `requiresApproval` | `boolean` | — | Block `deployRelease()` until approved |
+| `requiredApprovers` | `string[]` | — | Approver IDs (informational; enforced by your policy) |
 
 #### `ReleaseChange` actions
 
@@ -603,10 +679,14 @@ const release = await rl.flags.createRelease({
 
 ---
 
-### `listReleases()`
+### `listReleases(filters?)`
 
 ```ts
-listReleases(): Promise<Release[]>
+listReleases(filters?: {
+  environment?: string
+  status?: string        // 'pending' | 'deployed' | 'rolled_back' | 'scheduled'
+  limit?: number
+}): Promise<Release[]>
 ```
 
 ### `previewRelease(releaseId)`
@@ -658,6 +738,31 @@ await rl.flags.rollbackRelease(release.id, {
 
 ---
 
+### `approveRelease(releaseId, approverId, options?)` / `rejectRelease(releaseId, rejectorId, options?)`
+
+For releases created with `requiresApproval: true`. `deployRelease()` throws `ReleaseConflictError` until the release is approved. (Requires a DB adapter that implements release approvals.)
+
+```ts
+approveRelease(releaseId: string, approverId: string, options?: { actor?: AuditActor }): Promise<Release>
+rejectRelease(releaseId: string, rejectorId: string, options?: { reason?: string; actor?: AuditActor }): Promise<Release>
+```
+
+```ts
+const release = await rl.flags.createRelease({ name: 'Q3 launch', changes, requiresApproval: true })
+await rl.flags.approveRelease(release.id, 'u_lead')
+await rl.flags.deployRelease(release.id)   // now allowed
+```
+
+### `runScheduledReleases()`
+
+Deploy every release whose `scheduledAt` is now due. Call it from a cron/worker. No-op when the adapter doesn't implement `listScheduledReleases`.
+
+```ts
+runScheduledReleases(): Promise<{ deployed: string[]; failed: Array<{ id: string; error: string }> }>
+```
+
+---
+
 ## FlagManager — Kill Switch
 
 ### `kill(key, options?)`
@@ -674,6 +779,14 @@ Kill all active flags (emergency incident response).
 
 ```ts
 killAll(options?: { reason?: string; killedBy?: string; actor?: AuditActor }): Promise<void>
+```
+
+### `archive(key, options?)`
+
+Soft-delete a flag (status → `archived`). Archived flags return their `defaultValue` (reason `disabled`) and are excluded from `evaluateAll`. This is what `DELETE /admin/flags/:key` calls — prefer it over `delete()` for reversible removal.
+
+```ts
+archive(key: string, options?: ArchiveFlagInput): Promise<void>
 ```
 
 ### `restore(key, options?)`
@@ -722,7 +835,7 @@ await rl.flags.setLock('critical_flag', {
 await rl.flags.setLock('critical_flag', { locked: false })
 ```
 
-Operations blocked by lock: `update`, `addRule`, `updateRule`, `removeRule`, `reorderRules`, `setRollout`, `kill`, `delete`.
+Operations blocked by lock: `update`, `addRule`, `updateRule`, `removeRule`, `reorderRules`, `setRollout`. The lifecycle operations `kill`, `restore`, `archive`, `delete`, and `clone` are **not** lock-checked — locking guards configuration edits, not the emergency kill switch.
 
 ---
 
@@ -749,7 +862,7 @@ removeTags(key: string, tags: string[]): Promise<void>
 Get the audit trail for a flag.
 
 ```ts
-getHistory(key: string): Promise<HistoryEntry[]>
+getHistory(key: string, opts?: { limit?: number }): Promise<HistoryEntry[]>
 ```
 
 **Returns:** Chronological list of all mutations, each with:
@@ -845,6 +958,160 @@ const unsubscribe = rl.flags.onChange((event) => {
 
 // Later
 unsubscribe()
+```
+
+### `on(event, callback)` / `off(event, callback)`
+
+Subscribe to typed change events (the same `HistoryAction` set used by webhooks) in-process. Use `"*"` to receive every event. This is the local counterpart to outbound webhooks.
+
+```ts
+on(event: HistoryAction | "*", cb: (payload: WebhookPayload) => void | Promise<void>): void
+off(event: HistoryAction | "*", cb: (payload: WebhookPayload) => void | Promise<void>): void
+```
+
+```ts
+const onKill = (p) => alertOncall(p.flagKey)
+rl.flags.on('flag.killed', onKill)
+rl.flags.off('flag.killed', onKill)
+```
+
+### `trackEvent(input)`
+
+Record a custom conversion/analytics event (for experiments). Persisted via the adapter's `trackEvent` and forwarded to `config.analyticsSink` when configured. SDK name/version are auto-attached.
+
+```ts
+trackEvent(input: TrackEventInput): Promise<TrackingEvent | void>
+
+interface TrackEventInput {
+  event: string                        // required, e.g. 'purchase'
+  userId?: string
+  anonymousId?: string
+  value?: number
+  metadata?: Record<string, unknown>
+  context?: FlagContext
+}
+```
+
+```ts
+await rl.flags.trackEvent({ event: 'purchase', userId: 'u_alice', value: 49.99 })
+```
+
+> This is what `POST /api/rollease/events` calls. Pair with the [Statistics Engine](stats.md) to analyze outcomes.
+
+---
+
+## FlagManager — Bulk Operations
+
+### `bulkCreate(inputs)` / `bulkUpdate(updates)`
+
+Create/update many flags in one call. Individual failures are **returned** (not thrown) so partial success is possible.
+
+```ts
+bulkCreate(inputs: CreateFlagInput[]): Promise<{ created: Flag[]; errors: Array<{ key: string; error: string }> }>
+bulkUpdate(updates: Array<{ key: string; patch: UpdateFlagInput }>): Promise<{ updated: Flag[]; errors: Array<{ key: string; error: string }> }>
+```
+
+### `bulkDelete(keys, options)`
+
+Permanently delete many flags. Requires `{ confirm: true }`. Stops and throws on the first failure.
+
+```ts
+bulkDelete(keys: string[], options: { confirm: boolean; actor?: AuditActor }): Promise<void>
+```
+
+---
+
+## FlagManager — Exclusion Layers
+
+Exclusion (mutual-exclusion) layers carve a 0–100 bucket space into disjoint allocations so a user can be in at most one of several competing experiments. Requires a DB adapter that implements exclusion-layer methods; otherwise these throw `ValidationError`.
+
+```ts
+createExclusionLayer(input: ExclusionLayer, opts?: { actor?: AuditActor }): Promise<ExclusionLayer>
+getExclusionLayer(key: string): Promise<ExclusionLayer | null>
+updateExclusionLayer(key: string, allocations: ExclusionLayerAllocation[], opts?: { actor?: AuditActor }): Promise<ExclusionLayer>
+deleteExclusionLayer(key: string, opts?: { actor?: AuditActor }): Promise<void>
+listExclusionLayers(): Promise<ExclusionLayer[]>
+```
+
+```ts
+await rl.flags.createExclusionLayer({
+  key: 'pricing_experiments',
+  flagKeys: ['exp.price_a', 'exp.price_b'],
+  allocations: [
+    { flagKey: 'exp.price_a', startBucket: 0,  endBucket: 50 },
+    { flagKey: 'exp.price_b', startBucket: 50, endBucket: 100 },
+  ],
+})
+```
+
+Allocations are validated: buckets within `[0,100]`, `startBucket < endBucket`, no overlaps, and every allocation's `flagKey` must be declared in `flagKeys`.
+
+---
+
+## FlagManager — Privacy & GDPR
+
+### `forgetUser(userId, scope?)`
+
+Erase a user's data (right-to-erasure). `scope` limits which stores are cleared; default clears all supported. No-op/throws depending on adapter support.
+
+```ts
+forgetUser(userId: string, scope?: Array<'impressions' | 'assignments' | 'history' | 'events'>): Promise<void>
+```
+
+### `getUserImpressions(userId, opts?)`
+
+Return the flags a user was exposed to, what value they received, and when (right-to-explanation). Backs `GET /admin/users/:userId/impressions`.
+
+```ts
+getUserImpressions(userId: string, opts?: { limit?: number; flagKey?: string }): Promise<Array<{
+  flagKey: string; userId: string; value: unknown; variant: string | null; reason: string; at: Date
+}>>
+```
+
+### `runRetentionPolicies()`
+
+Enforce `privacy.impressionRetentionDays` / `privacy.auditRetentionDays`. Safe to run on a schedule; no-op when neither window is configured or the adapter lacks the delete methods.
+
+```ts
+runRetentionPolicies(): Promise<{
+  impressionsDeleted: number
+  historyDeleted: number
+  errors: Array<{ scope: 'impressions' | 'history'; error: string }>
+}>
+```
+
+---
+
+## FlagManager — Health & Metrics
+
+### `health()`
+
+Returns DB/cache/circuit health plus evaluation counters. Backs `GET /api/rollease/health`. Also exposed on the client as `rl.health()`.
+
+```ts
+health(): Promise<RolleaseHealthResult>
+```
+
+See [Observability — Health probe](observability.md#4-health-probe) for the full shape.
+
+### `getMetrics()`
+
+Serialize the configured metrics adapter to Prometheus text. Returns `''` when no `metrics` adapter is configured. Backs `GET /api/rollease/metrics`.
+
+```ts
+getMetrics(): string
+```
+
+---
+
+## FlagManager — Stale Flags
+
+### `getStaleFlags(opts?)`
+
+List active flags not evaluated since `staleDays` ago (default 30) — useful for paying down flag debt. Requires an adapter that records `lastEvaluatedAt`.
+
+```ts
+getStaleFlags(opts?: { staleDays?: number; namespace?: string }): Promise<Flag[]>
 ```
 
 ---
@@ -1011,33 +1278,71 @@ Edge-safe: returns `{}` when `fs` is not available (Edge runtimes, browser).
 
 ## React Integration
 
-Available from `rollease/react`.
+Available from `rollease/react`. For the full client/server flow (live browser client + the internal API), see **[Client & Server](client-server.md)**. Using Vue, Svelte, or Angular instead? See **[Framework Integrations](frameworks.md)**.
 
 ### `<RolleaseProvider>`
+
+Supplies flag results to the tree. Accepts **one of three** sources (priority: `client` > `initialFlags` > `flagsUrl`):
 
 ```tsx
 import { RolleaseProvider } from 'rollease/react'
 
-<RolleaseProvider initialFlags={flags}>
-  <App />
-</RolleaseProvider>
+// Live browser client (real-time, preferred with createHandler):
+<RolleaseProvider client={rlClient}>{children}</RolleaseProvider>
+
+// Static SSR hydration (FlagMap or DetailedFlagMap — auto-detected):
+<RolleaseProvider initialFlags={flags}>{children}</RolleaseProvider>
+
+// Provider-managed fetch + polling:
+<RolleaseProvider flagsUrl="/api/rollease/flags" refreshInterval={15000}>{children}</RolleaseProvider>
 ```
 
-Accepts either `FlagMap` or `Record<string, FlagResult>` — auto-detects format.
+| Prop | Type | Description |
+|------|------|-------------|
+| `client` | `RolleaseBrowserClient` | A client from `rollease/client`; subscribes to its real-time updates |
+| `initialFlags` | `FlagMap \| Record<string, FlagResult>` | Pre-evaluated flags (auto-detects plain vs detailed) |
+| `flagsUrl` | `string` | URL to fetch flags from on mount (ignored when `client` is set) |
+| `refreshInterval` | `number` | Poll interval in ms (default `30000`, `0` disables); `flagsUrl` mode only |
+| `fetchOptions` | `RequestInit` | Custom fetch options for `flagsUrl` mode |
+| `onRefresh` / `onError` | `(…) => void` | Refresh/error callbacks |
 
-### `useFlag(key)` → `{ enabled, loading, error }`
+### Hooks
 
-### `useVariant(key)` → `{ variant, loading, error }`
+All flag hooks read from context and share the async lifecycle fields `{ isLoading, isRefetching, error, refetch, invalidate, lastUpdatedAt }`.
 
-### `useFlags()` → `FlagMap`
+| Hook | Returns |
+|------|---------|
+| `useFlag(key)` | `{ enabled, isLoading, isRefetching, error, refetch, invalidate, lastUpdatedAt }` |
+| `useVariant(key)` | `{ variant: Variant \| null, …lifecycle }` |
+| `useFlagValue<T>(key, defaultValue)` | `T` — typed value with fallback |
+| `useFlags()` | `{ flags: FlagMap, …lifecycle }` |
+| `useFlagDetails(key)` | `{ details: FlagResult, …lifecycle }` |
+| `useWatchFlag(key)` | `{ enabled, value, variant, reason, isLoading, error }` — memoized, re-renders only on that key |
+| `useFlagSet(keys)` | `{ features: Record<string, boolean>, isLoading, error }` |
+| `useRollease()` | The full context object (`flags`, `flagDetails`, lifecycle) |
 
-### `useFlagDetails(key)` → `FlagResult`
+> Note the field is **`isLoading`**, not `loading`. Hooks throw if used outside a `<RolleaseProvider>`.
 
-### `useRollease()` → `{ flags, flagDetails }`
+```tsx
+const { enabled, isLoading, error, refetch } = useFlag('new_checkout')
+if (isLoading) return <Skeleton />
+if (error) return <ErrorBanner onRetry={refetch} />
+return enabled ? <NewCheckout /> : <OldCheckout />
+```
 
-### `<FeatureGate flag={key} fallback={...}>`
+### Components
 
-Declarative conditional rendering.
+```tsx
+// Renders children when the flag is on; fallback when off; loading while fetching.
+<FeatureGate flag="new_invoice_list" loading={<Skeleton />} fallback={<LegacyList />}>
+  <NewInvoiceList />
+</FeatureGate>
+
+// Renders children only when ALL listed flags are enabled.
+<FeatureRequire flags={['beta_api', 'new_checkout']} fallback={<Locked />}>
+  <BetaCheckoutFlow />
+</FeatureRequire>
+```
 
 ---
 

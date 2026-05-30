@@ -122,6 +122,16 @@
       "import": "./dist/migrations.mjs",
       "require": "./dist/migrations.js"
     },
+    "./sync": {
+      "types": "./dist/sync.d.ts",
+      "import": "./dist/sync.mjs",
+      "require": "./dist/sync.js"
+    },
+    "./stats": {
+      "types": "./dist/stats.d.ts",
+      "import": "./dist/stats.mjs",
+      "require": "./dist/stats.js"
+    },
     "./db/memory": {
       "types": "./dist/db/memory.d.ts",
       "import": "./dist/db/memory.mjs",
@@ -161,6 +171,11 @@
       "types": "./dist/db/cloudflare-kv.d.ts",
       "import": "./dist/db/cloudflare-kv.mjs",
       "require": "./dist/db/cloudflare-kv.js"
+    },
+    "./db/cloudflare-d1": {
+      "types": "./dist/db/cloudflare-d1.d.ts",
+      "import": "./dist/db/cloudflare-d1.mjs",
+      "require": "./dist/db/cloudflare-d1.js"
     },
     "./core/types": {
       "types": "./dist/core/types.d.ts",

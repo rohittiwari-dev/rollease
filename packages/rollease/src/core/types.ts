@@ -107,6 +107,12 @@ export interface RolleaseConfig {
    * Ignored when `signingKeys` is not provided.
    */
   currentSigningKeyId?: string;
+  /**
+   * Pluggable analytics sink. All `trackEvent()` calls are forwarded here in
+   * addition to the database adapter. Use to dual-write to Segment, Mixpanel,
+   * PostHog, etc.
+   */
+  analyticsSink?: AnalyticsSink;
 }
 
 export interface ResilienceConfig {
@@ -201,6 +207,14 @@ export interface ImpressionConfig {
   };
 }
 
+/**
+ * Pluggable analytics sink. When configured, all `trackEvent()` calls are also
+ * forwarded to this sink — useful for dual-writing to Segment, Mixpanel, etc.
+ */
+export interface AnalyticsSink {
+  track(event: TrackingEvent): void | Promise<void>;
+}
+
 export interface TrackEventInput {
   userId?: string;
   anonymousId?: string;
@@ -209,6 +223,10 @@ export interface TrackEventInput {
   metadata?: Record<string, unknown>;
   context?: FlagContext;
   ts?: number | string | Date;
+  /** SDK name auto-attached by the SDK (e.g. 'rollease-server', 'rollease-browser'). */
+  sdkName?: string;
+  /** SDK version auto-attached by the SDK. */
+  sdkVersion?: string;
 }
 
 export interface TrackingEvent {
@@ -220,6 +238,8 @@ export interface TrackingEvent {
   metadata?: Record<string, unknown>;
   context?: FlagContext;
   environment?: string;
+  sdkName?: string;
+  sdkVersion?: string;
   createdAt: Date;
 }
 
@@ -235,12 +255,14 @@ export interface RolleaseHooks {
   }) => Promise<void> | void;
   /**
    * Called before a single flag evaluation. Throwing aborts evaluation.
-   * Use to enforce tenant-isolation or permission checks at read time.
+   * Returning a `FlagContext` object replaces the evaluation context — use this
+   * to enrich or canonicalize context (e.g. resolve GeoIP, inject tenant fields).
+   * Throwing aborts the evaluation (use for RBAC denials at read time).
    */
   onBeforeEvaluation?: (ctx: {
     flagKey: string;
     context: FlagContext;
-  }) => Promise<void> | void;
+  }) => Promise<FlagContext | void> | FlagContext | void;
   /**
    * Called after every evaluation (single or bulk). Fire-and-forget — errors are logged.
    */
@@ -407,6 +429,13 @@ export interface RolloutConfig {
   sticky: boolean;
   /** Which context field to hash on (default: 'userId') */
   hashKey: string;
+  /**
+   * Optional salt mixed into the bucket hash. Changing this reshuffles which
+   * users fall in/out of rollout without re-keying the flag. Useful for
+   * re-running experiments or fixing biased splits.
+   * @default '' (empty string — uses the flag key as the sole hash input)
+   */
+  salt?: string;
   /** Auto-ramp schedule — percentage increases automatically at given dates */
   rampSchedule?: RampStep[];
 }

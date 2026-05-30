@@ -975,6 +975,47 @@ export class MemoryDbAdapter implements DbAdapter {
     return events.slice(-limit);
   }
 
+  async deleteImpressionsBefore(cutoff: Date): Promise<number> {
+    const before = this.impressions.length;
+    this.impressions = this.impressions.filter(
+      (i) => !i["at"] || new Date(i["at"] as string) >= cutoff
+    );
+    return before - this.impressions.length;
+  }
+
+  async deleteHistoryBefore(cutoff: Date): Promise<number> {
+    const before = this.history.length;
+    this.history = this.history.filter((h) => h.at >= cutoff);
+    return before - this.history.length;
+  }
+
+  async transaction<T>(fn: (tx: import("./adapter").DbAdapter) => Promise<T>): Promise<T> {
+    // Snapshot all mutable state.
+    const snapFlags = new Map(Array.from(this.flags.entries()).map(([k, v]) => [k, { ...v }]));
+    const snapRules = new Map(Array.from(this.rules.entries()).map(([k, v]) => [k, v.map((r) => ({ ...r }))]));
+    const snapSegments = new Map(Array.from(this.segments.entries()).map(([k, v]) => [k, { ...v }]));
+    const snapReleases = new Map(Array.from(this.releases.entries()).map(([k, v]) => [k, { ...v }]));
+    const snapAssignments = new Map(this.assignments);
+    const snapHistory = [...this.history];
+    const snapImpressions = [...this.impressions];
+    const snapEvents = [...this.trackingEvents];
+
+    try {
+      return await fn(this);
+    } catch (err) {
+      // Rollback: restore all state to the snapshot.
+      this.flags = snapFlags;
+      this.rules = snapRules;
+      this.segments = snapSegments;
+      this.releases = snapReleases;
+      this.assignments = snapAssignments;
+      this.history = snapHistory;
+      this.impressions = snapImpressions;
+      this.trackingEvents = snapEvents;
+      throw err;
+    }
+  }
+
   async getUserImpressions(
     userId: string,
     opts?: { limit?: number; flagKey?: string }

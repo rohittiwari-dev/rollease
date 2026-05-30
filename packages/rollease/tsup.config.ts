@@ -29,6 +29,7 @@ export default defineConfig({
     "db/drizzle": "src/db/drizzle.ts",
     "db/repository": "src/db/repository.ts",
     "db/cloudflare-kv": "src/db/cloudflare-kv.ts",
+    "db/cloudflare-d1": "src/db/cloudflare-d1.ts",
     "db/vercel-kv": "src/db/vercel-kv.ts",
     "db/deno-kv": "src/db/deno-kv.ts",
 
@@ -54,6 +55,12 @@ export default defineConfig({
 
     // Migrations
     migrations: "src/migrations/index.ts",
+
+    // Sync (export/diff/promote)
+    sync: "src/sync.ts",
+
+    // Statistics engine (A/B test analysis)
+    stats: "src/stats.ts",
   },
   format: ["cjs", "esm"],
   dts: true,

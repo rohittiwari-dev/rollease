@@ -299,7 +299,7 @@ interface DbAdapter {
   updateFlag(key: string, patch: UpdateFlagInput): Promise<Flag>
   deleteFlag(key: string): Promise<void>
   listFlags(input?: ListFlagsInput): Promise<ListFlagsResult>
-  getAllActiveFlags(pageSize?: number): Promise<Flag[]>
+  getAllActiveFlags(opts?: { keys?: string[]; namespace?: string; tags?: string[]; limit?: number; offset?: number }): Promise<Flag[]>
 
   // Rules
   addRule(flagKey: string, input: AddRuleInput): Promise<FlagRule>
@@ -317,7 +317,7 @@ interface DbAdapter {
 
   // Releases
   createRelease(input: CreateReleaseInput): Promise<Release>
-  listReleases(): Promise<Release[]>
+  listReleases(filters?: { environment?: string; status?: string; limit?: number }): Promise<Release[]>
   getRelease(id: string): Promise<Release | null>
   deployRelease(id: string, deployedBy?: string): Promise<void>
   rollbackRelease(id: string, rolledBackBy?: string, reason?: string): Promise<void>
@@ -328,8 +328,8 @@ interface DbAdapter {
   setUserAssignment(flagKey: string, userId: string, variantKey: string): Promise<void>
 
   // History
-  addHistoryEntry(entry: HistoryEntry): Promise<void>
-  getHistory(flagKey: string): Promise<HistoryEntry[]>
+  addHistory(entry: HistoryEntry): Promise<void>
+  getHistory(flagKey: string, opts?: { limit?: number }): Promise<HistoryEntry[]>
 
   // Impressions (optional)
   trackImpression?(impression: ImpressionData): Promise<void>

@@ -101,9 +101,9 @@ try {
 | `code` | `FLAG_NOT_FOUND` |
 | `meta` | `{ flagKey: string }` |
 
-**Thrown by:** `get()`, `update()`, `delete()`, `kill()`, `restore()`, `archive()`, `addRule()`, `updateRule()`, `removeRule()`, `setRollout()`, `setLock()`, `clone()`, `addTags()`, `removeTags()`, `getHistory()`
+**Thrown by:** `get()`, `update()`, `kill()`, `restore()`, `archive()`, `addRule()`, `updateRule()`, `removeRule()`, `reorderRules()`, `setRollout()`, `setLock()`, `addTags()`, `removeTags()`
 
-**Not thrown by:** `isEnabled()`, `getValue()`, `getVariant()` — these return safe defaults for missing flags instead of throwing.
+**Not thrown by:** `isEnabled()`, `getValue()`, `getVariant()` — these return safe defaults for missing flags instead of throwing. Also **not** thrown by `delete()` (it doesn't verify existence — deleting an unknown key is a no-op) or `getHistory()` (returns `[]` for an unknown flag).
 
 ```ts
 // Safe — never throws for missing flags
@@ -123,9 +123,9 @@ const flag = await rl.flags.get('nonexistent')  // → throws!
 | `code` | `FLAG_LOCKED` |
 | `meta` | `{ flagKey: string, reason?: string }` |
 
-**Thrown by:** `update()`, `delete()`, `kill()`, `addRule()`, `updateRule()`, `removeRule()`, `reorderRules()`, `setRollout()`
+**Thrown by:** `update()`, `addRule()`, `updateRule()`, `removeRule()`, `reorderRules()`, `setRollout()`
 
-Flags are locked via `setLock()`. Locked flags cannot be modified through any API — this is an intentional security boundary for compliance-sensitive flags.
+Flags are locked via `setLock()`. Locking blocks edits to a flag's **definition, rules, and rollout**. Note that the lifecycle operations `kill()`, `restore()`, `archive()`, `delete()`, and `clone()` do **not** check the lock — a locked flag can still be killed (emergency off) or removed. Unlock with `setLock(key, { locked: false })`.
 
 ```ts
 await rl.flags.setLock('critical_flag', {
@@ -181,7 +181,7 @@ Common validation failures:
 | Unsafe regex | `conditions.any[0] contains an unsafe regex pattern` |
 | Condition depth | `conditions exceeds maximum nesting depth` |
 | Condition count | `conditions exceeds maximum condition count` |
-| Delete without confirm | `Deletion requires { confirm: true }` |
+| Delete without confirm | `You must pass { confirm: true } to delete a flag` |
 | Bad secret | `Rollease secret must be at least 16 characters long` |
 | Path traversal | `Override file path must resolve inside the current working directory` |
 
@@ -207,7 +207,7 @@ Common validation failures:
 | `code` | `SEGMENT_NOT_FOUND` |
 | `meta` | `{ segmentKey: string }` |
 
-**Thrown by:** `updateSegment()`, `deleteSegment()`, `getSegmentUsage()`
+**Thrown by:** `updateSegment()`, `deleteSegment()` (`getSegmentUsage()` returns `[]` for an unknown segment — it does not throw)
 
 ---
 
@@ -219,7 +219,9 @@ Common validation failures:
 | `code` | `RELEASE_NOT_FOUND` |
 | `meta` | `{ releaseId: string }` |
 
-**Thrown by:** `deployRelease()`, `rollbackRelease()`, `previewRelease()`
+**Thrown by:** `rollbackRelease()`, `approveRelease()`, `rejectRelease()` — surfaced from the DB adapter when the release id is unknown.
+
+> ⚠️ `deployRelease()` and `previewRelease()` throw **`ValidationError`** (message `"Release not found"`, `statusCode` 422) for an unknown release id, because the manager checks existence before delegating to the adapter. Don't `catch (e) { if (e instanceof ReleaseNotFoundError) }` around `deployRelease`/`previewRelease`.
 
 ---
 
@@ -231,7 +233,7 @@ Common validation failures:
 | `code` | `RELEASE_CONFLICT` |
 | `meta` | `{ releaseId: string, details?: string }` |
 
-**Thrown by:** `deployRelease()` — when a release has already been deployed, or references flags in conflicting states.
+**Thrown by:** `deployRelease()` — when the release has `requiresApproval: true` and its `approvalStatus` is not `"approved"`.
 
 ---
 

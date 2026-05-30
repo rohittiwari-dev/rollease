@@ -274,6 +274,34 @@ export interface DbAdapter {
    */
   listScheduledReleases?(): Promise<Release[]>;
 
+  // ── Retention Policies ───────────────────────────────────────────────
+
+  /**
+   * Delete impression records older than `cutoff`. Used by
+   * `FlagManager.runRetentionPolicies()` when `privacy.impressionRetentionDays`
+   * is configured.
+   */
+  deleteImpressionsBefore?(cutoff: Date): Promise<number>;
+
+  /**
+   * Delete history entries older than `cutoff`. Used by
+   * `FlagManager.runRetentionPolicies()` when `privacy.auditRetentionDays`
+   * is configured.
+   */
+  deleteHistoryBefore?(cutoff: Date): Promise<number>;
+
+  // ── Transactions ─────────────────────────────────────────────────────
+
+  /**
+   * Execute `fn` inside an atomic transaction. On error, all writes inside
+   * `fn` are rolled back. When absent, the manager falls back to sequential
+   * writes (no rollback on partial failure).
+   *
+   * Implement this in production SQL adapters for safe deployRelease and
+   * bulk mutations.
+   */
+  transaction?<T>(fn: (tx: DbAdapter) => Promise<T>): Promise<T>;
+
   // ── Lifecycle ────────────────────────────────────────────────────────
 
   /** Close any active database connections. */

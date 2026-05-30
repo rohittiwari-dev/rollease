@@ -16,3 +16,8 @@ export const INTERNAL_SECRET = Symbol.for("rollease.internal.secret");
 export type WithInternalSecret = {
   [INTERNAL_SECRET]?: () => string;
 };
+
+/** Auto-attached to every tracked event for downstream attribution. */
+export const SDK_NAME = "rollease";
+// IMPORTANT: keep in sync with package.json `version`. CI checks this match.
+export const SDK_VERSION = "0.0.0-alpha.0";

@@ -126,7 +126,7 @@ describe("RBAC — createRelease action", () => {
     const policy = createDefaultRBACPolicy({ u_admin: "admin", u_editor: "editor" });
     const hook = createRBACHook(policy);
     const { manager } = mkManager({
-      hooks: { onBeforeMutation: (ctx) => hook(ctx.action, ctx.flagKey, ctx.actor) },
+      hooks: { onBeforeMutation: hook },
     });
 
     const adminActor: AuditActor = { id: "u_admin", type: "user", name: "Admin" };
@@ -152,7 +152,7 @@ describe("RBAC — createRelease action", () => {
     const policy = createDefaultRBACPolicy({ u_viewer: "viewer" });
     const hook = createRBACHook(policy);
     const { manager } = mkManager({
-      hooks: { onBeforeMutation: (ctx) => hook(ctx.action, ctx.flagKey, ctx.actor) },
+      hooks: { onBeforeMutation: hook },
     });
 
     const viewerActor: AuditActor = { id: "u_viewer", type: "user", name: "Viewer" };
@@ -176,7 +176,7 @@ describe("RBAC — rejectRelease permission", () => {
     const policy = createDefaultRBACPolicy({ u_admin: "admin", u_viewer: "viewer" });
     const hook = createRBACHook(policy);
     const { manager } = mkManager({
-      hooks: { onBeforeMutation: (ctx) => hook(ctx.action, ctx.flagKey, ctx.actor) },
+      hooks: { onBeforeMutation: hook },
     });
 
     await manager.create({ key: "r_flag", type: "boolean", defaultValue: false, actor: adminActor });
@@ -199,7 +199,7 @@ describe("RBAC — rejectRelease permission", () => {
     const policy = createDefaultRBACPolicy({ u_admin: "admin", u_editor: "editor" });
     const hook = createRBACHook(policy);
     const { manager } = mkManager({
-      hooks: { onBeforeMutation: (ctx) => hook(ctx.action, ctx.flagKey, ctx.actor) },
+      hooks: { onBeforeMutation: hook },
     });
 
     await manager.create({ key: "r2_flag", type: "boolean", defaultValue: false, actor: adminActor });

@@ -393,6 +393,7 @@ export function createRollease(config: RolleaseConfig): RolleaseClient {
     dbReader: config.dbReader,
     cacheNamespace: config.cacheNamespace,
     audit: config.audit,
+    analyticsSink: config.analyticsSink,
   });
 
   // Capture the secret in a closure so it never appears on the public client

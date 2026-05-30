@@ -80,6 +80,7 @@ import {
 } from "../core/logger";
 import type { MetricsAdapter } from "../core/metrics";
 import { createExposureTracker, type ExposureTracker } from "../core/exposure";
+import { SDK_NAME, SDK_VERSION } from "../core/internal";
 
 type ChangeListener = (event: {
   flagKey: string;
@@ -134,6 +135,7 @@ export class FlagManager {
   private dbReader?: DbAdapter;
   private cacheNamespace: string;
   private audit?: import("../core/types").AuditConfig;
+  private analyticsSink?: import("../core/types").AnalyticsSink;
 
   constructor(opts: {
     db: DbAdapter;
@@ -157,6 +159,7 @@ export class FlagManager {
     dbReader?: DbAdapter;
     cacheNamespace?: string;
     audit?: import("../core/types").AuditConfig;
+    analyticsSink?: import("../core/types").AnalyticsSink;
   }) {
     this.db = opts.db;
     this.l1Cache = new MemoryCacheAdapter();
@@ -175,6 +178,7 @@ export class FlagManager {
     this.dbReader = opts.dbReader;
     this.cacheNamespace = opts.cacheNamespace ?? "";
     this.audit = opts.audit;
+    this.analyticsSink = opts.analyticsSink;
     if (opts.impressions?.dedupe) {
       this.exposureTracker = createExposureTracker(opts.impressions.dedupe);
     }
@@ -605,8 +609,11 @@ export class FlagManager {
     const prereqResultCache = new Map<string, FlagResult>();
 
     for (const flag of filteredFlags) {
+      // Per-flag context so the hook can scope replacements without leaking
+      // between flags in the same evaluateAll call.
+      let flagContext = activeContext;
       try {
-        await this.runBeforeEvaluation(flag.key, activeContext);
+        flagContext = await this.runBeforeEvaluation(flag.key, activeContext);
       } catch (err) {
         // Hook denied this flag — surface as disabled rather than crashing
         // the whole evaluateAll call. RBAC will use this path for tenant
@@ -634,14 +641,14 @@ export class FlagManager {
         for (const prereq of flag.prerequisites) {
           let prereqResult = prereqResultCache.get(prereq.flagKey);
           if (!prereqResult) {
-            prereqResult = await this.evaluate(prereq.flagKey, activeContext);
+            prereqResult = await this.evaluate(prereq.flagKey, flagContext);
             prereqResultCache.set(prereq.flagKey, prereqResult);
           }
           prerequisiteResults[prereq.flagKey] = prereqResult;
         }
       }
 
-      const evalResult = evaluateFlag(flag, activeContext, {
+      const evalResult = evaluateFlag(flag, flagContext, {
         rules,
         userAssignment: assignments[flag.key] ?? undefined,
         localOverride: this.getLocalOverride(flag.key),
@@ -652,8 +659,8 @@ export class FlagManager {
       });
       result[flag.key] = evalResult;
       this.metrics?.increment("rollease_evaluations_total", { flag: flag.key });
-      this.maybeTrackImpression(evalResult, activeContext);
-      this.fireOnEvaluate(evalResult, activeContext);
+      this.maybeTrackImpression(evalResult, flagContext);
+      this.fireOnEvaluate(evalResult, flagContext);
       this.touchFlagEvaluation(flag.key);
     }
 
@@ -1000,7 +1007,17 @@ export class FlagManager {
     }
 
     await this.runMutationHook("release.deployed", undefined, opts?.actor);
-    await this.db.deployRelease(releaseId, opts?.deployedBy);
+    // Run the full deploy inside an atomic transaction when the adapter
+    // supports it — guarantees that a partial failure across the release's
+    // change set rolls back cleanly. Adapters without `transaction()` fall
+    // back to sequential writes with no rollback.
+    if (typeof this.db.transaction === "function") {
+      await this.db.transaction(async (tx) => {
+        await tx.deployRelease(releaseId, opts?.deployedBy);
+      });
+    } else {
+      await this.db.deployRelease(releaseId, opts?.deployedBy);
+    }
     await this.bustAllCaches();
     this.emit({ flagKey: "*", action: "release_deployed" });
     this.webhookDispatcher.dispatch("release.deployed", undefined, { releaseId });
@@ -1134,22 +1151,113 @@ export class FlagManager {
     return [];
   }
 
+  /**
+   * Enforce retention windows from `privacy.impressionRetentionDays` and
+   * `privacy.auditRetentionDays`. Safe to call on a schedule (cron, k8s job).
+   * No-op when neither window is configured or when the adapter doesn't
+   * implement the corresponding delete methods.
+   */
+  async runRetentionPolicies(): Promise<{
+    impressionsDeleted: number;
+    historyDeleted: number;
+    errors: Array<{ scope: "impressions" | "history"; error: string }>;
+  }> {
+    const now = Date.now();
+    let impressionsDeleted = 0;
+    let historyDeleted = 0;
+    const errors: Array<{ scope: "impressions" | "history"; error: string }> = [];
+
+    if (this.privacy.impressionRetentionDays && this.db.deleteImpressionsBefore) {
+      const cutoff = new Date(
+        now - this.privacy.impressionRetentionDays * 24 * 60 * 60 * 1000
+      );
+      try {
+        impressionsDeleted = await this.withDbResilience(
+          "deleteImpressionsBefore",
+          () => this.db.deleteImpressionsBefore!(cutoff)
+        );
+      } catch (err) {
+        const msg = errMessage(err);
+        this.logger.warn("impression retention failed", { err: msg });
+        errors.push({ scope: "impressions", error: msg });
+      }
+    }
+
+    if (this.privacy.auditRetentionDays && this.db.deleteHistoryBefore) {
+      const cutoff = new Date(
+        now - this.privacy.auditRetentionDays * 24 * 60 * 60 * 1000
+      );
+      try {
+        historyDeleted = await this.withDbResilience(
+          "deleteHistoryBefore",
+          () => this.db.deleteHistoryBefore!(cutoff)
+        );
+      } catch (err) {
+        const msg = errMessage(err);
+        this.logger.warn("audit retention failed", { err: msg });
+        errors.push({ scope: "history", error: msg });
+      }
+    }
+
+    return { impressionsDeleted, historyDeleted, errors };
+  }
+
   // ── Scheduled Releases ───────────────────────────────────────────────
 
   async trackEvent(event: TrackEventInput): Promise<TrackingEvent | void> {
     if (!event.event || typeof event.event !== "string") {
       throw new ValidationError("event is required");
     }
-    if (!this.db.trackEvent) {
-      this.logger.debug("trackEvent skipped: adapter does not support events", {
+    const safeContext = event.context ? this.scrubContext(event.context) : undefined;
+    // Auto-attach SDK metadata so downstream analytics can attribute by origin.
+    const enriched: TrackEventInput = {
+      ...event,
+      context: safeContext,
+      sdkName: event.sdkName ?? SDK_NAME,
+      sdkVersion: event.sdkVersion ?? SDK_VERSION,
+    };
+
+    let dbResult: TrackingEvent | undefined;
+    if (this.db.trackEvent) {
+      const out = await this.withDbResilience("trackEvent", () =>
+        this.db.trackEvent!(enriched)
+      );
+      dbResult = out ?? undefined;
+    } else {
+      this.logger.debug("trackEvent: adapter does not support events", {
         event: event.event,
       });
-      return;
     }
-    const safeContext = event.context ? this.scrubContext(event.context) : undefined;
-    return this.withDbResilience("trackEvent", () =>
-      this.db.trackEvent!({ ...event, context: safeContext })
-    );
+
+    // Forward to pluggable analytics sink (Segment, Mixpanel, PostHog, etc.).
+    // Failures here must never break the primary tracking path.
+    if (this.analyticsSink) {
+      const sinkEvent: TrackingEvent =
+        dbResult ??
+        {
+          id: `evt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+          userId: enriched.userId,
+          anonymousId: enriched.anonymousId,
+          event: enriched.event,
+          value: enriched.value,
+          metadata: enriched.metadata,
+          context: enriched.context,
+          environment: this.environment,
+          sdkName: enriched.sdkName,
+          sdkVersion: enriched.sdkVersion,
+          createdAt: new Date(),
+        };
+      Promise.resolve()
+        .then(() => this.analyticsSink!.track(sinkEvent))
+        .catch((err) =>
+          this.logger.warn("analyticsSink.track failed", {
+            event: enriched.event,
+            err: errMessage(err),
+          })
+        );
+    }
+
+    return dbResult;
   }
 
   async close(): Promise<void> {
@@ -1410,7 +1518,9 @@ export class FlagManager {
     }
 
     try {
-      await this.runBeforeEvaluation(key, context);
+      // Hook may return a replacement context (e.g. enriched with GeoIP,
+      // tenant fields, or canonicalized userId). Capture and continue.
+      context = await this.runBeforeEvaluation(key, context);
     } catch (err) {
       // Hook rejected this evaluation (e.g. RBAC). Surface as disabled +
       // default value with a recognizable reason.
@@ -1863,10 +1973,20 @@ export class FlagManager {
   private async runBeforeEvaluation(
     flagKey: string,
     context: FlagContext
-  ): Promise<void> {
-    if (!this.hooks.onBeforeEvaluation) return;
+  ): Promise<FlagContext> {
+    if (!this.hooks.onBeforeEvaluation) return context;
     // Pass scrubbed context so PII never reaches hook handlers.
-    await this.hooks.onBeforeEvaluation({ flagKey, context: this.scrubContext(context) });
+    const result = await this.hooks.onBeforeEvaluation({
+      flagKey,
+      context: this.scrubContext(context),
+    });
+    // Hooks may return a replacement FlagContext to enrich/canonicalize the
+    // evaluation context (resolve GeoIP, inject tenant, etc.). Returning
+    // void/null/undefined keeps the caller's context.
+    if (result && typeof result === "object") {
+      return result;
+    }
+    return context;
   }
 
   private fireOnEvaluate(result: FlagResult, context: FlagContext): void {

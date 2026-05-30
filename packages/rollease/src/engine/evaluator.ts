@@ -529,7 +529,8 @@ export function evaluateFlag<T = unknown>(
 
   if (flag.type === "multivariate" && flag.variants && flag.variants.length > 0) {
     if (hashValue) {
-      const bucket = getBucket(hashValue, flag.key);
+      const salt = flag.rollout?.salt ?? "";
+      const bucket = getBucket(hashValue, flag.key, salt);
       const sorted = [...flag.variants].sort((a, b) => a.key.localeCompare(b.key));
       let cumWeight = 0;
       for (const v of sorted) {
@@ -542,7 +543,8 @@ export function evaluateFlag<T = unknown>(
     }
   } else if (flag.rollout && hashValue) {
     const effectivePct = resolveRolloutPercentage(flag.rollout, now);
-    const bucket = getBucket(hashValue, flag.key);
+    const salt = flag.rollout.salt ?? "";
+    const bucket = getBucket(hashValue, flag.key, salt);
     if (bucket < effectivePct) {
       const value = flag.type === "boolean" ? true : flag.defaultValue;
       pushStep(10, "rollout", true, `percentage ${effectivePct}%, bucket ${bucket}`);
