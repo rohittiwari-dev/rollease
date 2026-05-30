@@ -1,7 +1,7 @@
 // ============================================================================
-// Phase 2 regression tests — proves Tier 2/3 features are fully wired across
-// every adapter (memory + sequelize + repository contract), the webhook
-// dispatcher is Edge-safe, and all manager lifecycle gaps are closed.
+// Regression tests proving extended features are wired across every adapter
+// (memory + sequelize + repository contract), the webhook dispatcher is
+// Edge-safe, and all manager lifecycle paths are exercised.
 // ============================================================================
 
 import { describe, expect, it, vi } from "vitest";
@@ -40,7 +40,7 @@ function mgr(opts?: {
 
 // ── Webhook dispatcher (Edge-safe) ──────────────────────────────────────────
 
-describe("Phase 2-A: Edge-safe webhook dispatcher", () => {
+describe("Edge-safe webhook dispatcher", () => {
   it("uses Web Crypto (SubtleCrypto) for HMAC signatures — no Node crypto dependency", async () => {
     // The webhook module is the surface: importing it should not require
     // node:crypto. Verify the produced signature round-trips through the
@@ -120,7 +120,7 @@ describe("Phase 2-A: Edge-safe webhook dispatcher", () => {
 
 // ── Adapter column contracts ────────────────────────────────────────────────
 
-describe("Phase 2-B/C: Adapter column contracts cover all Tier 2/3 fields", () => {
+describe("Adapter column contracts cover all extended fields", () => {
   it("repository.Flag contract includes prerequisites/environmentDefaults/exclusionLayer/clientVisible/lastEvaluatedAt", () => {
     expect(ROLLEASE_REPOSITORY_REQUIRED_COLUMNS.Flag).toEqual(
       expect.arrayContaining([
@@ -179,7 +179,7 @@ describe("Phase 2-B/C: Adapter column contracts cover all Tier 2/3 fields", () =
 
 // ── Manager wiring fixes ─────────────────────────────────────────────────────
 
-describe("Phase 2-D: Manager lifecycle wiring", () => {
+describe("Manager lifecycle wiring", () => {
   it("evaluateAllDetailed resolves prerequisites recursively (was unwired)", async () => {
     const { manager } = mgr();
     await manager.create({ key: "parent", type: "boolean", defaultValue: false });
@@ -345,7 +345,7 @@ describe("Phase 2-D: Manager lifecycle wiring", () => {
 
 // ── Input validation ─────────────────────────────────────────────────────────
 
-describe("Phase 2-E: Input validation", () => {
+describe("Input validation", () => {
   it("createExclusionLayer rejects overlapping bucket allocations", async () => {
     const { manager } = mgr();
     const layer: ExclusionLayer = {
@@ -440,8 +440,8 @@ describe("Phase 2-E: Input validation", () => {
 
 // ── Repository persistence end-to-end (proxies for Prisma/Drizzle) ──────────
 
-describe("Phase 2-B: Repository adapter persists Tier 2/3 fields end-to-end", () => {
-  it("Tier 2/3 fields are written and read back through the in-memory repository fake", async () => {
+describe("Repository adapter persists extended fields end-to-end", () => {
+  it("extended fields are written and read back through the in-memory repository fake", async () => {
     // We simulate a Prisma/Drizzle delegate using a generic row store. This
     // proves the RepositoryDbAdapter wiring (createFlag / addRule /
     // createRelease) round-trips the new fields rather than dropping them.
@@ -496,7 +496,7 @@ describe("Phase 2-B: Repository adapter persists Tier 2/3 fields end-to-end", ()
       ExclusionLayer: makeRepo("ExclusionLayer"),
     });
 
-    // Flag with all the new Tier 2/3 fields.
+    // Flag with all the new extended fields.
     await adapter.createFlag({
       key: "tier2_flag",
       type: "boolean",

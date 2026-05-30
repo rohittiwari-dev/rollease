@@ -103,10 +103,9 @@ export interface SequelizeAdapterOptions {
 
 
 /**
- * Models that are required for the adapter to construct successfully. The
- * `ExclusionLayer` model is optional (kept here in this record for the
- * column contract, but skipped by `validateSequelizeAdapterModels` when
- * absent so existing users without that table aren't blocked).
+ * `ExclusionLayer` is optional — it's kept in the column contract record but
+ * skipped by `validateSequelizeAdapterModels` when absent so existing users
+ * without that table aren't blocked on construction.
  */
 export const ROLLEASE_SEQUELIZE_REQUIRED_MODELS: SequelizeAdapterModelName[] = [
   "Flag",
@@ -252,8 +251,8 @@ export class SequelizeDbAdapter implements DbAdapter {
       rollout: input.rollout,
       scheduledAt: input.scheduledAt ? new Date(input.scheduledAt) : null,
       expiresAt: input.expiresAt ? new Date(input.expiresAt) : null,
-      // Tier 2/3 fields — persist when provided so Sequelize-backed adapters
-      // surface the same surface as Memory/Repository adapters.
+      // Persist all optional fields so this adapter exposes the same surface
+      // as the Memory and Repository adapters.
       prerequisites: input.prerequisites ?? null,
       environmentDefaults: input.environmentDefaults ?? null,
       exclusionLayer: input.exclusionLayer ?? null,
@@ -774,7 +773,7 @@ export class SequelizeDbAdapter implements DbAdapter {
         { where: { key } }
       );
     } catch {
-      // best-effort
+      // Best-effort: never throws so callers can safely fire-and-forget.
     }
   }
 
@@ -1193,7 +1192,7 @@ export class SequelizeDbAdapter implements DbAdapter {
           rollout: field(DataTypes, "JSON"),
           scheduledAt: field(DataTypes, "DATE"),
           expiresAt: field(DataTypes, "DATE"),
-          // Tier 2/3 — prerequisites, env-defaults, exclusion, stale-detect.
+          // Optional flag fields — prerequisites, environment defaults, exclusion layer reference, and stale detection.
           prerequisites: field(DataTypes, "JSON"),
           environmentDefaults: field(DataTypes, "JSON"),
           exclusionLayer: field(DataTypes, "STRING"),
@@ -1218,7 +1217,7 @@ export class SequelizeDbAdapter implements DbAdapter {
           rolloutPct: field(DataTypes, "FLOAT"),
           isHoldout: field(DataTypes, "BOOLEAN"),
           variantId: field(DataTypes, "STRING"),
-          // Tier 2 — user-list, description, metadata for rules.
+          // Optional rule fields — user list, description, and operational metadata.
           userIds: field(DataTypes, "JSON"),
           description: field(DataTypes, "TEXT"),
           metadata: field(DataTypes, "JSON"),
@@ -1254,7 +1253,7 @@ export class SequelizeDbAdapter implements DbAdapter {
           rolledBackAt: field(DataTypes, "DATE"),
           rolledBackBy: field(DataTypes, "STRING"),
           rollbackReason: field(DataTypes, "TEXT"),
-          // Tier 2 — approval workflow.
+          // Approval workflow fields — only relevant when requiresApproval is true.
           requiresApproval: field(DataTypes, "BOOLEAN"),
           requiredApprovers: field(DataTypes, "JSON"),
           approvalStatus: field(DataTypes, "STRING"),
@@ -1303,7 +1302,7 @@ export class SequelizeDbAdapter implements DbAdapter {
         },
         { tableName: table("impressions"), timestamps: false }
       ),
-      // Tier 2/3 — Mutual exclusion layers (Statsig-style "layers").
+      // Mutual exclusion layer model (Statsig-style experiment bucketing groups).
       ExclusionLayer: this.useModel(
         "ExclusionLayer",
         model("ExclusionLayer"),

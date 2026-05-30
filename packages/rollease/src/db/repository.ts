@@ -56,7 +56,6 @@ export type RepositoryName =
  */
 export type OptionalRepositoryName = "ExclusionLayer";
 
-/** Combined name union for typing of the repository map. */
 export type AnyRepositoryName = RepositoryName | OptionalRepositoryName;
 
 export interface RepositoryFindManyOptions {
@@ -77,9 +76,8 @@ export interface RowRepository {
 }
 
 /**
- * Set of row repositories required by the adapter. Optional repos (e.g.
- * `ExclusionLayer`) are added via the Partial intersection so existing
- * users without those tables continue to construct without errors.
+ * Optional repos (e.g. `ExclusionLayer`) are added via the Partial intersection
+ * so existing users without those tables continue to construct without errors.
  */
 export type RepositorySet = Record<RepositoryName, RowRepository> &
   Partial<Record<OptionalRepositoryName, RowRepository>>;
@@ -213,9 +211,8 @@ export class RepositoryDbAdapter implements DbAdapter {
       rollout: input.rollout,
       scheduledAt: input.scheduledAt ? new Date(input.scheduledAt) : null,
       expiresAt: input.expiresAt ? new Date(input.expiresAt) : null,
-      // Tier 2/3 fields — persist when provided so the storage layer doesn't
-      // silently drop them, which would make these features no-ops on Prisma
-      // and Drizzle.
+      // Persist all optional fields explicitly — some storage layers (Prisma,
+      // Drizzle) silently drop unknown keys, which would make these features no-ops.
       prerequisites: input.prerequisites ?? null,
       environmentDefaults: input.environmentDefaults ?? null,
       exclusionLayer: input.exclusionLayer ?? null,
@@ -439,7 +436,7 @@ export class RepositoryDbAdapter implements DbAdapter {
       rolloutPct: input.rolloutPct,
       isHoldout: input.isHoldout,
       variantId: input.variantId,
-      // Tier 2 — persist user-list, description, and operational metadata.
+      // Optional rule fields — user list, description, and operational metadata.
       userIds: input.userIds ?? null,
       description: input.description ?? null,
       metadata: input.metadata ?? null,
@@ -592,7 +589,7 @@ export class RepositoryDbAdapter implements DbAdapter {
         rolledBackAt: null,
         rolledBackBy: undefined,
         rollbackReason: undefined,
-        // Tier 2 — approval workflow fields.
+        // Approval workflow fields — only relevant when requiresApproval is true.
         requiresApproval: input.requiresApproval ?? false,
         requiredApprovers: input.requiredApprovers ?? null,
         approvalStatus: input.requiresApproval ? "pending" : null,
@@ -825,10 +822,8 @@ export class RepositoryDbAdapter implements DbAdapter {
     userId: string
   ): Promise<Record<string, string>> {
     if (flagKeys.length === 0) return {};
-    // Most repositories accept simple `{ field: value }` where-clauses; for
-    // a multi-key match we fan out one findOne per key but keep this single
-    // method so callers benefit from the batched signature today and from a
-    // future `findMany({ where: { userId, flagKey: { in: [...] } } })` later.
+    // Repositories only support simple equality where-clauses, not IN queries,
+    // so we fetch all assignments for the user and filter in memory.
     const out: Record<string, string> = {};
     const rows = await this.repositories.Assignment.findMany({
       where: { userId },
@@ -897,9 +892,8 @@ export class RepositoryDbAdapter implements DbAdapter {
     limit?: number;
     offset?: number;
   }): Promise<Flag[]> {
-    // Fetch ALL active flags first, then apply filters, then paginate.
-    // This ensures namespace/tags/keys filters don't miss results that
-    // happen to fall outside the first page boundary.
+    // Filter before paginating so namespace/tags/keys filters don't miss
+    // results that fall outside the requested page window.
     const list = await this.listFlags({ status: "active" });
     let flags = list.data;
     if (opts?.namespace) {
@@ -917,7 +911,6 @@ export class RepositoryDbAdapter implements DbAdapter {
     if (opts?.keys?.length) {
       flags = flags.filter((flag) => opts.keys!.includes(flag.key));
     }
-    // Apply pagination AFTER filtering
     const offset = opts?.offset ?? 0;
     if (opts?.limit !== undefined) {
       flags = flags.slice(offset, offset + opts.limit);
@@ -949,9 +942,8 @@ export class RepositoryDbAdapter implements DbAdapter {
   }
 
   // ── Exclusion Layers ─────────────────────────────────────────────────
-  // Optional repository — these methods throw a clear, actionable error
-  // when the `ExclusionLayer` repository isn't provided. The manager
-  // surfaces this as a ValidationError to the caller.
+  // Optional repository — callers get a ValidationError rather than a silent
+  // no-op when the ExclusionLayer table hasn't been registered.
 
   async createExclusionLayer(input: ExclusionLayer): Promise<ExclusionLayer> {
     const repo = this.requireExclusionRepo();

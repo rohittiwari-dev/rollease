@@ -4,9 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ---
 
-## [Unreleased]
+## [0.0.1] - 2026-05-30
 
-### Fixed (Phase 4-6 audit — 2026-05-28)
+### Fixed
 
 #### RBAC & Permissions
 - `createRelease` now fires `"release.created"` mutation hook action (was incorrectly `"release.deployed"`). Editors with `release.create` permission can now create releases.
@@ -103,7 +103,7 @@ All notable changes to this project will be documented in this file.
 - Maps all Rollease `EvalReason` values to OpenFeature reason codes.
 - Structural typing — no hard dependency on `@openfeature/core`.
 
-#### Security Hardening (Phase 1)
+#### Security Hardening
 - **Segment usage scanner** — recursive condition-tree walk replaces `JSON.stringify().includes()` false-positive check.
 - **Override path traversal guard** — `validateOverridePath()` rejects `localOverridesFile` values that escape `process.cwd()`.
 - **Prototype-pollution key rejection** — `isSafeFlagKey()` blocks `__proto__`, `constructor`, `prototype`, `toString`, `hasOwnProperty` as flag or segment keys.
@@ -112,7 +112,7 @@ All notable changes to this project will be documented in this file.
 - **Lazy `next/server` import** — `import 'rollease/next'` works in plain Node, Vitest, and CLI tools without pulling in Next.js.
 - **Edge-safe `fs`** — `loadLocalOverrides` returns `{}` silently when `process.versions.node` is absent.
 
-#### RBAC / Audit Scaffolding
+#### RBAC & Audit
 - `AuditActor` type (`id`, `type`, `name`, `metadata`) accepted as optional `actor` on all write methods.
 - `RolleaseHooks` — `onBeforeMutation`, `onBeforeEvaluation`, `onEvaluate` hooks. Throwing in a before-hook aborts the operation.
 - `LoggingConfig` — `level` + `sink` replace direct `console.*` calls throughout the SDK.

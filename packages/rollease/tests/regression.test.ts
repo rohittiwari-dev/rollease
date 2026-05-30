@@ -1,5 +1,5 @@
 // ============================================================================
-// Regression tests for Phase 4-6 bug fixes
+// Regression tests for previously fixed bugs
 // ============================================================================
 // Covers: RBAC wiring, scrubContext top-level fields, createRelease action,
 // rejectRelease RBAC gating, exposure dedup wiring, metrics wiring,

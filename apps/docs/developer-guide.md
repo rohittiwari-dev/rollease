@@ -1,8 +1,8 @@
 # Rollease SDK — Developer Guide
 
-> **Status:** Alpha (`0.0.0-alpha.0`)  
+> **Status:** Stable (`0.0.1`)  
 > **Author:** Rohit Tiwari  
-> **Last reviewed:** 2026-05-27
+> **Last reviewed:** 2026-05-30
 
 ---
 
@@ -23,8 +23,7 @@
 13. [Rollouts & Releases](#13-rollouts--releases)
 13b. [Flag Validation](#13b-flag-validation)
 14. [Security Model](#14-security-model)
-15. [Issues Found & Status](#15-issues-found--status)
-16. [What More Can Be Done](#16-what-more-can-be-done)
+15. [Roadmap & Cross-References](#15-roadmap--cross-references)
 
 ---
 
@@ -1407,77 +1406,7 @@ Condition groups are validated before storage:
 
 ---
 
-## 15. Issues Found & Status
-
-This section tracks issues discovered during development. All items have been resolved.
-
-### ✅ Issue 1 — Cache reads bypass the cache (HIGH) — RESOLVED
-
-**Status:** Fixed. `FlagManager.evaluate()` now reads through L1 → L2 → DB cache layers via `getFlagCached()` and `getRulesCached()`.
-
-### ✅ Issue 2 — Module-level state in `overrides.ts` (MEDIUM) — RESOLVED
-
-**Status:** Fixed. Override cache is now instance state on `FlagManager`, not module-level globals.
-
-### ✅ Issue 3 — `fs` module breaks Edge runtime (MEDIUM) — RESOLVED
-
-**Status:** Fixed. `overrides.ts` lazy-loads `fs` behind `isNodeRuntime()` guard.
-
-### ✅ Issue 4 — `pg` is a hard dependency (MEDIUM) — RESOLVED
-
-**Status:** Fixed. `pg` is now an optional `peerDependency`.
-
-### ✅ Issue 5 — Rollback loses `setValue` / `setRollout` changes (MEDIUM) — RESOLVED
-
-**Status:** Fixed. `deployRelease()` captures `ReleaseSnapshot[]` before applying changes. Snapshots are deduplicated per flagKey.
-
-### ✅ Issue 6 — `getFlag()` in RSC loses variant/reason (LOW) — RESOLVED
-
-**Status:** Fixed. The middleware now uses v2 transport with full `FlagResult` objects.
-
-### ✅ Issue 7 — `__rollease.secret` exposed on client object (LOW) — RESOLVED
-
-**Status:** Fixed. Secret stored in closure, accessed via non-enumerable Symbol-keyed property.
-
-### ✅ Issue 8 — `evaluateAll` makes N DB calls for N flags (LOW) — RESOLVED
-
-**Status:** Fixed. Batch-fetches assignments via `getUserAssignments()`.
-
-### ⚠️ Issue 9 — `enabled` field is always `true` for non-boolean default (LOW) — BY DESIGN
-
-**Status:** Documented. Use `reason === 'default'` to check if the default path was taken.
-
-### ✅ Issue 10 — `in` operator broken for segments (HIGH) — RESOLVED
-
-**Status:** Fixed. The `in` operator now handles string expected + array actual (segment matching). Previously `{ dimension: "segment", op: "in", value: "enterprise_users" }` with `context.segments = ["enterprise_users"]` silently returned `false`.
-
-### ✅ Issue 11 — `exists` operator wrong for `expected: false` (MEDIUM) — RESOLVED
-
-**Status:** Fixed. `{ op: "exists", expected: false }` now correctly returns `true` when value is `null`/`undefined`.
-
-### ✅ Issue 12 — `updateFlag` dropped variant/rollout updates (MEDIUM) — RESOLVED
-
-**Status:** Fixed. `MemoryDbAdapter.updateFlag()` no longer overwrites variants and rollout when the input provides new values.
-
-### ✅ Issue 13 — Invalid semver returned `true` instead of `false` (MEDIUM) — RESOLVED
-
-**Status:** Fixed. `semverCompare` returns `null` for invalid versions, and `semverGte`/`semverLte` fail closed (return `false`).
-
-### ✅ Issue 14 — Pagination before filter in `getAllActiveFlags` (MEDIUM) — RESOLVED
-
-**Status:** Fixed in both RepositoryDbAdapter and SequelizeDbAdapter. Filters (namespace/tags/keys) are now applied BEFORE pagination.
-
-### ✅ Issue 15 — Module-level ID counter causes collisions (LOW) — RESOLVED
-
-**Status:** Fixed. ID counter moved from module scope to instance field in MemoryDbAdapter, RepositoryDbAdapter, and SequelizeDbAdapter.
-
-### ✅ Issue 16 — `evaluateConditionGroup` not exported (LOW) — RESOLVED
-
-**Status:** Fixed. Added to public exports in `index.ts`.
-
----
-
-## 16. Roadmap & Cross-References
+## 15. Roadmap & Cross-References
 
 Several capabilities listed as "future work" in early drafts of this guide have since **shipped**. They each have a dedicated guide:
 

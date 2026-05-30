@@ -20,4 +20,4 @@ export type WithInternalSecret = {
 /** Auto-attached to every tracked event for downstream attribution. */
 export const SDK_NAME = "rollease";
 // IMPORTANT: keep in sync with package.json `version`. CI checks this match.
-export const SDK_VERSION = "0.0.0-alpha.0";
+export const SDK_VERSION = "0.0.1";

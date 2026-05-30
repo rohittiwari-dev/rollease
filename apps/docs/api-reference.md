@@ -1,7 +1,7 @@
 # Rollease SDK — API Reference
 
 > **Package:** `rollease`  
-> **Version:** 0.0.0-alpha.0  
+> **Version:** 0.0.1  
 > **Last updated:** 2026-05-30
 
 This reference covers the **programmatic** (`rl.flags.*`) API. For the **REST/HTTP** surface exposed by `rl.createHandler()` (evaluation + admin routes, RBAC, client keys), see the **[HTTP API Reference](http-api.md)**.
